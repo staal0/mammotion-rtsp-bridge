@@ -427,12 +427,34 @@ class AgoraToRtsp:
 
     def _writer_loop(self) -> None:
         while not self.stop_event.is_set():
+            # Proactive subprocess health check. Without this, if ffmpeg exits
+            # while frames aren't currently flowing (e.g. during the ~3s
+            # peer-recovery gap), we wouldn't detect it until the next write —
+            # by which point go2rtc has been serving 404s for a long time.
+            with self._ffmpeg_lock:
+                ff = self._ffmpeg
+            if ff is not None and ff.poll() is not None:
+                logging.warning(
+                    "ffmpeg subprocess exited (returncode=%s); will restart on next keyframe",
+                    ff.returncode,
+                )
+                with self._ffmpeg_lock:
+                    self._cleanup_ffmpeg_locked()
+                self.waiting_for_keyframe = True
+                while True:
+                    try:
+                        self.frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                # Ask Mammotion for an immediate keyframe so we restart fast
+                # instead of waiting for the next natural one (~5s).
+                self.request_keyframe(reason="ffmpeg_exited")
+                continue
+
             try:
                 chunk = self.frame_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            with self._ffmpeg_lock:
-                ff = self._ffmpeg
             stdin = ff.stdin if ff is not None else None
             if stdin is None:
                 continue
@@ -444,7 +466,6 @@ class AgoraToRtsp:
                 with self._ffmpeg_lock:
                     self._cleanup_ffmpeg_locked()
                 self.waiting_for_keyframe = True
-                # Drop queued frames so the next ffmpeg starts cleanly at a keyframe.
                 while True:
                     try:
                         self.frame_queue.get_nowait()
