@@ -1397,7 +1397,10 @@ class AgoraWebSocketHandler:
         """Translate Agora ICE candidates into SDP lines."""
         candidate_lines: list[str] = []
         for index, candidate in enumerate(candidates):
-            foundation = candidate.get("foundation", f"candidate{index}")
+            # Numeric foundation: Agora sends the non-numeric "udpcandidate",
+            # which go2rtc/pion's ICE parser can reject. A numeric foundation is
+            # always safe.
+            foundation = str(index + 1)
             protocol = candidate.get("protocol", "udp")
             priority = candidate.get("priority", 2103266323)
             ip = candidate.get("ip", "")
@@ -1408,9 +1411,12 @@ class AgoraWebSocketHandler:
                 "a=candidate:"
                 f"{foundation} 1 {protocol} {priority} {ip} {port} typ {candidate_type}"
             )
-            if candidate.get("generation") is not None:
-                line += f" generation {candidate.get('generation')}"
             candidate_lines.append(line)
+        # Signal that all candidates are present so the consumer (go2rtc) starts
+        # connectivity checks immediately rather than waiting for trickle. Its
+        # absence is why go2rtc never sent STUN -> Agora "channel stun timeout".
+        if candidate_lines:
+            candidate_lines.append("a=end-of-candidates")
         return candidate_lines
 
     @staticmethod
@@ -1492,7 +1498,6 @@ class AgoraWebSocketHandler:
             "a=rtcp:9 IN IP4 0.0.0.0",
             f"a=ice-ufrag:{ice_ufrag}",
             f"a=ice-pwd:{ice_pwd}",
-            "a=ice-options:trickle",
             f"a=fingerprint:{fingerprint}",
             "a=setup:active",
             f"a=mid:{mid}",
