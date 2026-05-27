@@ -179,6 +179,8 @@ The image is built and published by GitHub Actions
 `:stable` only moves when you cut a release; `:latest` moves on every commit to
 main. Most people should run `:stable`.
 
+See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
+
 Cut a release by tagging:
 
 ```bash
