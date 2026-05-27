@@ -158,6 +158,9 @@ class MammotionWhepManager:
 
     async def create_session(self, stream: str, offer_sdp: str) -> tuple[str, str]:
         """Create or replace the Agora session for one stream."""
+        # TEMP diagnostic: log go2rtc's offer so we can see its DTLS setup role
+        # and offered codecs vs. the answer we build.
+        LOGGER.info("go2rtc WHEP offer SDP:\n%s", offer_sdp)
         await self.close_session(stream)
 
         credentials = await self._credentials_provider()
