@@ -9,12 +9,12 @@
 services:
   mammotion-webrtc:
     container_name: mammotion-webrtc
-    # Build from the webrtc-passthrough branch checkout:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    # ...or, once you've pushed a test tag, pull instead:
-    # image: ghcr.io/bleialf/mammotion-rtsp-bridge:webrtc-test
+    # Prebuilt experimental image (amd64) from the webrtc-passthrough branch.
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:webrtc-test
+    # ...or build locally from the branch checkout instead:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
     restart: unless-stopped
     environment:
       BRIDGE_SCRIPT: "mammotion_webrtc_bridge.py"   # selects the WebRTC entrypoint
