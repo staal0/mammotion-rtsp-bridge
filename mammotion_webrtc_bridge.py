@@ -121,8 +121,10 @@ def _env_int(name: str, default: int) -> int:
 
 async def main() -> None:
     """Run the bridge: login, WHEP server, go2rtc registration, keep-alive."""
+    log_level = os.getenv("MAMMOTION_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
     email = os.getenv("MAMMOTION_EMAIL", "")
@@ -183,17 +185,7 @@ async def main() -> None:
                 await asyncio.sleep(reconnect_backoff)
         return None
 
-    async def credentials_provider() -> StreamCredentials:
-        """Return current Agora RTC credentials (called per WHEP session)."""
-        mammotion = state["mammotion"]
-        if mammotion is None:
-            raise RuntimeError("Mammotion client not ready")
-        fields = await fetch_stream_fields(mammotion, state["device_name"])
-        for key in ("appid", "channelName", "token", "uid"):
-            if not fields.get(key):
-                raise RuntimeError(f"Missing {key} in stream subscription payload")
-        state["device_name"] = fields["device_name"]
-        state["iot_id"] = fields["iot_id"]
+    def _creds_from_fields(fields: dict[str, Any]) -> StreamCredentials:
         return StreamCredentials(
             app_id=str(fields["appid"]),
             channel=str(fields["channelName"]),
@@ -201,6 +193,21 @@ async def main() -> None:
             uid=int(fields["uid"]),
             area_code=resolve_area_code_string(fields.get("areaCode")),
         )
+
+    async def credentials_provider() -> StreamCredentials:
+        """Return cached Agora RTC credentials (set at login).
+
+        Deliberately does NOT re-fetch the stream subscription per WHEP session:
+        get_stream_subscription sends an MQTT command to the device every call,
+        which hammers the cloud and fails outright if the session has expired.
+        We reuse the credentials captured at login; token renewal is handled by
+        the Agora edge's will-expire signal path. If the token has fully expired
+        the next login cycle refreshes the cache.
+        """
+        creds = state.get("credentials")
+        if creds is None:
+            raise RuntimeError("Mammotion credentials not ready")
+        return creds
 
     # ---- Start the WHEP aiohttp server (long-lived) ----
     app = create_whep_app(credentials_provider, auth_token=whep_token)
@@ -233,6 +240,7 @@ async def main() -> None:
                         )
                 state["device_name"] = fields["device_name"]
                 state["iot_id"] = fields["iot_id"]
+                state["credentials"] = _creds_from_fields(fields)
                 LOGGER.info(
                     "Stream subscription ready for device %s (channel=%s)",
                     fields["device_name"],

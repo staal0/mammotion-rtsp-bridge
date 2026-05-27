@@ -871,7 +871,15 @@ class AgoraWebSocketHandler:
         message = response.get("_message", {})
         ortc = message.get("ortc", {})
         if not ortc:
-            LOGGER.error("join_v3 success did not include ORTC parameters")
+            # Mammotion's join response may carry ORTC under a different key or
+            # nesting than PetKit's. Dump the structure so we can adapt.
+            LOGGER.error(
+                "join_v3 success did not include ORTC parameters. "
+                "response keys=%s; _message keys=%s; full _message=%s",
+                list(response.keys()),
+                list(message.keys()) if isinstance(message, dict) else type(message),
+                json.dumps(message)[:2000],
+            )
             return None
 
         await self._send_set_client_role(role="host", level=0)
