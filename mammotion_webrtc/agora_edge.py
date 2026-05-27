@@ -1024,6 +1024,9 @@ class AgoraWebSocketHandler:
             self._answer_sdp = answer_sdp
             self._pending_answer_ortc = None
             self._pending_offer_info = None
+            # TEMP diagnostic: full answer SDP so we can verify candidates /
+            # setup role / ufrag against go2rtc's ICE attempt.
+            LOGGER.info("Generated answer SDP:\n%s", answer_sdp)
             return answer_sdp
         return None
 
