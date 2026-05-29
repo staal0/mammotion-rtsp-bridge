@@ -1,0 +1,65 @@
+# Frigate + Mammotion bridge in a single compose file.
+#
+# The Mammotion bridge joins the mower's Agora WebRTC channel as a passive
+# subscriber (using a patched aiortc stack that accepts H265 as opaque RTP)
+# and serves the inbound packets verbatim from a small RTSP server. Frigate's
+# bundled go2rtc picks them up via `rtsp://mammotion-bridge:8554/<stream>`.
+# No ffmpeg, no transcoding.
+#
+# This is a trimmed copy of a real working setup — start from here and fill in
+# your own paths, credentials, and tuning.
+
+services:
+  frigate:
+    container_name: frigate
+    image: ghcr.io/blakeblackshear/frigate:stable
+    privileged: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: "1gb"  # adjust to your camera count
+    mem_swappiness: 0
+    devices:
+      - /dev/dri:/dev/dri  # Intel hwaccel — adjust for your hardware
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - frigate-config:/config
+      - frigate_model_data:/openvino-model
+      - /mnt/nvme/frigate:/media/frigate
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 500000000
+    environment:
+      FRIGATE_RTSP_PASSWORD: "change-me"
+      LIBVA_DRIVER_NAME: iHD
+    ports:
+      - "127.0.0.1:5000:5000"
+      - "8971:8971"
+      - "8555:8555"
+      - "8554:8554"
+      - "1984:1984"
+
+  mammotion-bridge:
+    container_name: mammotion-bridge
+    # :stable -> newest tagged release (recommended).
+    # :latest -> main branch HEAD. :0.1.3 -> pinned version.
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:stable
+    restart: unless-stopped
+    environment:
+      MAMMOTION_EMAIL: "your@email.com"
+      MAMMOTION_PASSWORD: "your-password"
+      # Device name in the Mammotion app, or "first" to auto-pick.
+      MAMMOTION_DEVICE_NAME: "first"
+      # go2rtc REST API base — the bridge auto-registers the stream here.
+      GO2RTC_API_URL: "http://frigate:1984"
+      # Name go2rtc registers the stream under.
+      MAMMOTION_STREAM_NAME: "mammotion"
+      # Host go2rtc uses to dial back to the bridge.
+      MAMMOTION_RTSP_HOST: "mammotion-bridge"
+    # Optional: expose RTSP on the host for direct testing (ffplay/VLC).
+    # ports:
+    #   - "5001:8554"
+
+volumes:
+  frigate-config:
+  frigate_model_data:

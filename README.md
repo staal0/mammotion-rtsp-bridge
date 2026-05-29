@@ -1,116 +1,140 @@
-# Mammotion -> go2rtc/Frigate WebRTC Bridge
+# Mammotion -> Frigate / go2rtc RTSP bridge
 
-WS-only WebRTC passthrough from Mammotion (Agora) into go2rtc/Frigate.
-
-This project now treats the old ffmpeg/transcode route as legacy. The supported
-path is signaling-only WebRTC restreaming through go2rtc-native WS signaling.
+Single-container bridge that gets a Mammotion mower's camera into Frigate (or
+any RTSP consumer) by joining the mower's Agora WebRTC channel as a passive
+subscriber and re-exposing the H265 stream over plain RTSP.
 
 ```
-Mammotion cloud -> Agora WebRTC -> bridge (signaling only) -> go2rtc -> Frigate
+Mammotion cloud -> Agora SFU -> bridge (aiortc subscriber)
+                                       |
+                                       v
+                              RTSP server :8554
+                                       |
+                                       v
+                          Frigate / go2rtc / VLC / ffplay
 ```
 
-## Status
+No ffmpeg, no transcoding. The Agora RTP packets are forwarded byte-for-byte;
+the bridge only rewrites the 12-byte RTP header (SSRC, sequence number,
+payload type) and leaves the H265 payload untouched.
 
-- Production path: WS signaling (`webrtc:ws://.../api/ws?src=...`)
-- WHEP path: unsupported/unreliable for Frigate/go2rtc in this project
-- ffmpeg path: legacy, no longer the recommended architecture
+> Unofficial. Not endorsed by Mammotion. Use at your own risk.
 
-> Unofficial and unsupported by Mammotion. Use at your own risk.
+> Use a separate Mammotion account shared from your main account. Mammotion
+> is effectively single-session, so using one account for both the app and the
+> bridge will cause one to log the other out.
 
-> Use a separate Mammotion account shared from your main account. Mammotion is
-effectively single-session, so one account for app + bridge causes logouts.
+## Why this architecture
 
-## What it does
+Earlier versions tried two other approaches; both lost to upstream realities:
 
-1. Logs into Mammotion cloud with pymammotion.
-2. Fetches Agora stream subscription credentials.
-3. Exposes go2rtc-compatible WS signaling on `/api/ws?src=<stream>`.
-4. Registers a go2rtc stream source pointing to that WS endpoint.
-5. Maintains publisher keepalive and reconnect behavior.
-6. Periodically re-ensures stream registration after Frigate/go2rtc restarts.
+- **ffmpeg transcode (0.1.1).** Worked but added CPU load, GOP-rewrite
+  artefacts, and a per-frame jitter problem. Replaced.
+- **WebRTC signaling passthrough (0.1.2).** The bridge brokered SDP only and
+  go2rtc was meant to be the WebRTC peer to Agora directly. go2rtc's Pion
+  stack does not interoperate cleanly with Agora's edge — `p2p_lost: Timeout`
+  ~10 s into every session — so the path was effectively dead on arrival for
+  this stream. Removed.
+
+The current path runs aiortc as the WebRTC peer (which talks to Agora's edge
+without issue), monkey-patches it to accept H265 as opaque bytes
+([mammotion_webrtc/h265_patch.py](mammotion_webrtc/h265_patch.py)), taps the
+inbound RTP, and republishes it as a minimal RTSP server. Frigate's bundled
+go2rtc then consumes it like any normal IP camera.
 
 ## Quick start
 
-1. Use [docker-compose.webrtc.yml](docker-compose.webrtc.yml) as your base.
-2. Fill in Mammotion credentials.
-3. Ensure this bridge can resolve/reach Frigate as `frigate:1984`.
-4. Start or recreate the service.
+1. Copy [docker-compose.example.yml](docker-compose.example.yml) into your
+   Frigate stack (or paste just the `mammotion-bridge` service into your
+   existing compose so it shares Frigate's network).
+2. Fill in `MAMMOTION_EMAIL`, `MAMMOTION_PASSWORD`, and (optionally)
+   `MAMMOTION_DEVICE_NAME`.
+3. Start:
 
 ```bash
-docker compose -f docker-compose.webrtc.yml pull
-docker compose -f docker-compose.webrtc.yml up -d --force-recreate
+docker compose pull mammotion-bridge
+docker compose up -d mammotion-bridge
 ```
 
-5. Validate in logs:
-
-- bridge startup shows `go2rtc signaling=ws`
-- on stream open, you see `go2rtc WS session established`
-
-## Frigate/go2rtc wiring
-
-The bridge auto-registers the stream in go2rtc using `GO2RTC_API_URL` and
-`MAMMOTION_STREAM_NAME`, so manual go2rtc source editing is usually not needed.
-
-Open in go2rtc UI with:
-
-`http://<frigate-host>:1984/stream.html?src=<MAMMOTION_STREAM_NAME>`
+4. The bridge logs in to the Mammotion cloud, joins the Agora channel,
+   starts its RTSP server, and registers itself with Frigate's go2rtc.
+5. Open `http://<frigate-host>:1984/stream.html?src=mammotion` to view.
 
 ## Configuration
 
-Primary environment variables for WS passthrough:
-
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BRIDGE_SCRIPT` | `mammotion_webrtc_bridge.py` | Selects WS passthrough entrypoint |
-| `MAMMOTION_EMAIL` | - | Mammotion account email |
-| `MAMMOTION_PASSWORD` | - | Mammotion account password |
-| `MAMMOTION_DEVICE_NAME` | `first` | Device name in app or `first` |
-| `GO2RTC_API_URL` | `http://frigate:1984` | go2rtc REST API base URL |
-| `MAMMOTION_STREAM_NAME` | `mammotion` | Stream name managed in go2rtc |
-| `MAMMOTION_WHEP_HOST` | container hostname | Host go2rtc uses to reach this service |
-| `MAMMOTION_WHEP_PORT` | `8555` | WS signaling listen port |
-| `MAMMOTION_GO2RTC_SIGNALING` | `ws` | Kept for compatibility; non-`ws` is ignored and forced to `ws` |
+| `MAMMOTION_EMAIL` | — | Mammotion cloud account email (**required**) |
+| `MAMMOTION_PASSWORD` | — | Mammotion cloud password (**required**) |
+| `MAMMOTION_DEVICE_NAME` | `first` | Device name in the app, or `first` to auto-pick |
+| `GO2RTC_API_URL` | `http://frigate:1984` | go2rtc REST API base for stream auto-registration |
+| `MAMMOTION_STREAM_NAME` | `mammotion` | Name go2rtc registers the stream under |
+| `MAMMOTION_RTSP_HOST` | container hostname | Hostname go2rtc uses to dial back to the bridge |
+| `MAMMOTION_RTSP_PORT` | `8554` | RTSP listen port inside the container |
+| `MAMMOTION_RTSP_BIND` | `0.0.0.0` | RTSP bind address |
 | `MAMMOTION_GO2RTC_RECONCILE_SECONDS` | `20` | Periodic go2rtc registration self-heal interval |
-| `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keepalive cadence |
-| `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Retry delay for cloud/session reconnect |
+| `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keepalive cadence to the mower |
+| `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Retry delay on cloud/session failure |
+| `MAMMOTION_LOG_LEVEL` | `INFO` | `DEBUG` exposes RTSP method exchange and signaling traces |
 
-## Reliability behavior
+## Viewer compatibility
 
-- WS session lifecycle handles trickle ICE continuously (fixes open-once/reopen failures).
-- Periodic reconciliation re-registers stream after Frigate/go2rtc restarts.
-- Keepalive and wakeup logic keep the mower publishing on Agora.
-- Fresh login loop recovers from stale cloud sessions.
+The bridge serves a plain RTP-over-RTSP H265 stream. Consumers tested:
 
-## Troubleshooting
+- **Frigate / go2rtc (RTSP source)** — works (this is the primary target).
+- **ffplay / VLC** — works (`rtsp://<host>:8554/<stream>`).
+- **go2rtc `stream.html?mode=webrtc`** — works smoothly when the browser
+  supports H265 over WebRTC (Safari/Chrome on Apple Silicon do).
+- **go2rtc `stream.html` (MSE default)** — choppy. Mammotion encodes at
+  ~10 fps and Chrome's MSE low-delay renderer stalls on low-framerate H265.
+  Use `&mode=webrtc` or play the RTSP URL directly.
 
-- Stream appears once then fails on reopen:
-  update to `v0.1.2` or newer; this includes WS lifecycle fix.
-- Stream missing after Frigate restart:
-  verify `MAMMOTION_GO2RTC_RECONCILE_SECONDS` is set (for example `20`).
-- Stream not opening in Frigate/go2rtc:
-  confirm both containers are on a shared network and `frigate` resolves from
-  bridge container.
-- CORS error about external `manifest.json` in go2rtc UI:
-  usually cosmetic; focus on actual stream errors (`webrtc disconnected`).
+## Reliability
+
+- The Agora subscription is self-healing with bounded backoff. If the upstream
+  WebRTC connection fails, the bridge tears it down and reconnects, refetching
+  cloud credentials so expired tokens are handled implicitly.
+- The bridge proactively keeps the mower publishing (MQTT
+  `send_todev_ble_sync` + `device_agora_join_channel_with_position`) — the
+  publisher otherwise times out roughly every 50 s and stops sending video.
+- go2rtc registration is reconciled periodically, so the stream comes back on
+  its own after a Frigate restart.
+- A fresh Mammotion login is performed per cycle so a stale cloud token can't
+  wedge the bridge for hours.
+
+## Limitations
+
+- **H265 only.** Mammotion's camera publishes H265; this bridge does not
+  transcode. Consumers that need H264 should put a transcoder downstream (or
+  use the Frigate `ffmpeg`-based hwaccel preset to record/restream as H264).
+- **No RTCP Sender Reports.** go2rtc gets RTP timestamps without a wall-clock
+  anchor. This is fine for Frigate (which timestamps on arrival) but can
+  cause MSE-mode browser playback to drift over long sessions.
+- **Single device per container.** Run one container per mower.
+- **Local-only is not possible.** All Mammotion video is brokered through
+  Agora's cloud; there is no documented LAN-direct path today.
 
 ## Integration idea for Mammotion-HA
 
-This approach can be embedded in Mammotion-HA by adding an opt-in WS signaling
-endpoint and reusing existing Agora token/recovery logic, then having go2rtc
-dial HA directly for signaling-only passthrough.
+The Agora-edge subscriber and H265 RTP tap could be folded into Mammotion-HA
+as an opt-in "expose camera as RTSP" feature, so users get a Frigate-ready
+camera without a side container. Happy to help wire it up — see the issue
+thread for context.
 
 ## Releases
 
-Image tags:
+| Tag | Meaning |
+| --- | --- |
+| `:stable` | Latest tagged release |
+| `:latest` | `main` branch HEAD |
+| `:x.y.z` | Pinned release |
+| `:sha-<short>` | Pinned commit |
 
-- `stable`: latest tagged release
-- `latest`: latest main branch build
-- `x.y.z`: pinned release version
-- `sha-<short>`: pinned commit build
-
-See [CHANGELOG.md](CHANGELOG.md) for details.
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Credits
 
-Built on [pymammotion](https://github.com/mikey0000/PyMammotion) for Mammotion
-auth and Agora integration.
+Built on [pymammotion](https://github.com/mikey0000/PyMammotion) for cloud
+auth and Agora token fetch. The H265 patch + relay design borrows ideas from
+the PetKit HA integration's Agora WebRTC client (MIT,
+© 2024-2026 @Jezza34000).

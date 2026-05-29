@@ -6,6 +6,37 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-29
+
+### Changed
+- **Replaced the architecture.** The bridge is now an aiortc-based passive
+  WebRTC subscriber that taps Agora's H265 RTP packets and republishes them
+  byte-for-byte from an embedded RTSP server. No ffmpeg, no transcoding, no
+  WHEP/WS signaling step — Frigate's go2rtc consumes the bridge with a plain
+  `rtsp://` source. See the rewritten README for the rationale.
+- Default (and only) entrypoint is `mammotion_webrtc_bridge.py`. Image no
+  longer needs `BRIDGE_SCRIPT` to select the relay.
+
+### Removed
+- Legacy ffmpeg transcode bridge (`mammotion_go2rtc_bridge.py`) — the new
+  passthrough path supersedes it.
+- WebRTC signaling passthrough mode (WHEP/WS) — Pion's interop with Agora's
+  edge is unreliable (`p2p_lost: Timeout` ~10 s into every session), so this
+  path is effectively unusable for Mammotion and has been removed.
+- `ffmpeg` apt package, the `docker-entrypoint.sh` wrapper, and the
+  `MAMMOTION_GO2RTC_SIGNALING` / `MAMMOTION_WHEP_*` env vars.
+- Stale `DESIGN-webrtc-passthrough.md` design notes.
+
+### Added
+- aiortc H265 patch (`mammotion_webrtc/h265_patch.py`) — registers H265 with
+  aiortc as opaque RTP so the SDP/codec-routing/decoder-spawn paths accept it
+  without a native H265 decoder dependency.
+- Minimal asyncio RTSP server (`mammotion_webrtc/rtsp_server.py`) with
+  TCP-interleaved transport, parameter-set-aware SDP, and per-session queue
+  back-pressure.
+- Single combined `docker-compose.example.yml` modelled on a real working
+  Frigate + bridge setup.
+
 ## [0.1.2] - 2026-05-28
 
 ### Added
@@ -42,6 +73,7 @@ First public release. Experimental.
 - Example configs for Frigate and standalone go2rtc, plus a documented HA
   advanced-camera-card snippet.
 
-[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.3
 [0.1.2]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.2
 [0.1.1]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.1
