@@ -13,4 +13,6 @@ websockets==16.0
 # edge using a libwebrtc-equivalent stack, then forwards H265 RTP to go2rtc via
 # MediaRelay. Avoids Pion's interop issues with Agora.
 aiortc==1.13.0
-av==13.1.0
+# av (PyAV) is a transitive dep of aiortc — let aiortc pick the version it
+# needs (currently aiortc 1.13 wants av>=14,<15). Pinning av separately
+# fights aiortc's own constraint and forces a resolver impossibility.
