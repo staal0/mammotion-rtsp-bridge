@@ -1,7 +1,20 @@
-pymammotion==0.7.115
-agora-python-server-sdk==2.4.5
+pymammotion==0.7.131
+# Note: pymammotion 0.7.83-0.7.116 are gated to Python 3.14 only; we're on
+# 3.13 in the image, so we pick the first version in the post-3.14-gate range.
+# Same 0.7 minor — the API surface used here (MammotionClient,
+# get_stream_subscription, send_command_with_args, device_registry) is stable.
+
 requests==2.32.5
-# WebRTC passthrough bridge (webrtc-passthrough branch): standalone WHEP server
-# + Agora edge WebSocket signaling client. Not needed by the main ffmpeg bridge.
 aiohttp==3.13.5
 websockets==16.0
+
+# aiortc joins Agora's edge as a passive WebRTC subscriber. Patched at import
+# time (mammotion_webrtc/h265_patch.py) to accept H265 as opaque RTP — aiortc
+# 1.13 has no native H265 support and we only need passthrough.
+aiortc==1.13.0
+
+# av (PyAV) pinned to the latest version with prebuilt cp313 wheels on both
+# amd64 and arm64 manylinux. 14.0.0/14.1.0/14.2.0 have them; 14.3.0/14.4.0 do
+# NOT — pip would otherwise pick 14.4.0 and try to compile from source.
+# aiortc 1.13's transitive constraint is av>=14,<15, which 14.2.0 satisfies.
+av==14.2.0
