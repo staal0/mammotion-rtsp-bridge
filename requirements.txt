@@ -3,7 +3,10 @@ pymammotion==0.7.131
 # so we pick the first version in the post-3.14-gate range. Same 0.7 minor,
 # API surface used by the bridge (MammotionClient, get_stream_subscription,
 # send_command_with_args, device_registry) is unchanged.
-agora-python-server-sdk==2.4.5
+# Note: agora-python-server-sdk (used only by the legacy ffmpeg bridge on
+# the main branch) has no cp313 wheel and is omitted from this image.
+# The aiortc relay (this branch) talks to Agora via aiortc instead, so it
+# does not need the native SDK. The :latest image still ships it.
 requests==2.32.5
 # WebRTC passthrough bridge (webrtc-passthrough branch): standalone WHEP server
 # + Agora edge WebSocket signaling client. Not needed by the main ffmpeg bridge.
@@ -13,6 +16,9 @@ websockets==16.0
 # edge using a libwebrtc-equivalent stack, then forwards H265 RTP to go2rtc via
 # MediaRelay. Avoids Pion's interop issues with Agora.
 aiortc==1.13.0
-# av (PyAV) is a transitive dep of aiortc — let aiortc pick the version it
-# needs (currently aiortc 1.13 wants av>=14,<15). Pinning av separately
-# fights aiortc's own constraint and forces a resolver impossibility.
+# av (PyAV) pinned to the latest version with prebuilt cp313 wheels on both
+# amd64 and arm64 manylinux (verified: 14.0.0/14.1.0/14.2.0 have them,
+# 14.3.0/14.4.0 do NOT — pip would otherwise pick 14.4.0 and try to compile
+# from source, which needs pkg-config + a full ffmpeg dev toolchain).
+# aiortc 1.13's transitive constraint is av>=14,<15, which 14.2.0 satisfies.
+av==14.2.0
