@@ -8,10 +8,11 @@ WORKDIR /app
 
 # ffmpeg: used by the legacy bridge.
 # libsrtp2-1: required by aiortc's SRTP layer (used by the aiortc-relay branch).
-# libopus0, libvpx7: media codec libs PyAV may dlopen at runtime.
+# PyAV's manylinux wheel statically links its own ffmpeg + libvpx + libopus,
+# so we don't need their dev/runtime packages here.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates libsrtp2-1 libopus0 libvpx7 \
+        ffmpeg ca-certificates libsrtp2-1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
