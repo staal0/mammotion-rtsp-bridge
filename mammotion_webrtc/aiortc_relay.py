@@ -37,6 +37,7 @@ from collections.abc import Awaitable, Callable
 from aiortc import RTCIceCandidate, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaRelay
 from aiortc.mediastreams import MediaStreamTrack
+from aiortc.rtcrtpsender import RTCRtpSender
 from aiortc.sdp import candidate_from_sdp
 
 from .agora_edge import (
@@ -108,7 +109,7 @@ class AgoraAiortcRelay:
             raise RuntimeError("Upstream video track unavailable; cannot relay")
 
         pc = RTCPeerConnection()
-        pc.addTrack(self._relay.subscribe(self._video_track))
+        video_sender = pc.addTrack(self._relay.subscribe(self._video_track))
         if self._audio_track is not None:
             pc.addTrack(self._relay.subscribe(self._audio_track))
 
@@ -118,9 +119,49 @@ class AgoraAiortcRelay:
             if pc.connectionState in ("failed", "closed", "disconnected"):
                 await self._detach_downstream(pc)
 
+        # Force H265 first in the answer so aiortc passes the upstream H265
+        # RTP through verbatim instead of transcoding to H264. aiortc's
+        # default codec ordering puts VP8/H264 ahead of H265, so without
+        # this hint negotiation picks H264 and triggers a decode + re-encode
+        # pipeline that silently produces no media for the Mammotion stream.
+        # Must be called BEFORE setRemoteDescription/createAnswer to affect
+        # the answer's codec ordering.
+        try:
+            video_codecs = RTCRtpSender.getCapabilities("video").codecs
+            h265 = [c for c in video_codecs if "h265" in c.mimeType.lower()]
+            other = [c for c in video_codecs if "h265" not in c.mimeType.lower()]
+            preferred = h265 + other
+            for transceiver in pc.getTransceivers():
+                if transceiver.sender is video_sender and preferred:
+                    transceiver.setCodecPreferences(preferred)
+                    LOGGER.info(
+                        "Set downstream video codec preferences (H265-first): %s",
+                        [c.mimeType for c in preferred],
+                    )
+                    break
+            if not h265:
+                LOGGER.warning(
+                    "aiortc reports no H265 sender capability; relay will "
+                    "transcode H265 -> H264 (may not work)"
+                )
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to set H265-first codec preferences")
+
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+
+        # TEMP diagnostics: log both the downstream offer (what go2rtc/Pion
+        # asks for) and the downstream answer aiortc generated. We need to
+        # see whether H265 actually gets negotiated end-to-end — if go2rtc
+        # offers only H264/VP8, aiortc has to either transcode (heavy) or
+        # mark the m-line inactive (no media).
+        LOGGER.info(
+            "DOWNSTREAM OFFER (from consumer):\n%s\n---\n"
+            "DOWNSTREAM ANSWER (from aiortc):\n%s",
+            offer_sdp,
+            pc.localDescription.sdp,
+        )
 
         self._downstream_pcs.add(pc)
         self._cancel_idle_cleanup()
