@@ -5,3 +5,8 @@ requests==2.32.5
 # + Agora edge WebSocket signaling client. Not needed by the main ffmpeg bridge.
 aiohttp==3.13.5
 websockets==16.0
+# aiortc relay (aiortc-relay branch): bridge becomes the WebRTC peer to Agora's
+# edge using a libwebrtc-equivalent stack, then forwards H265 RTP to go2rtc via
+# MediaRelay. Avoids Pion's interop issues with Agora.
+aiortc==1.13.0
+av==13.1.0

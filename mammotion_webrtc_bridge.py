@@ -45,7 +45,11 @@ from typing import Any
 
 from aiohttp import web
 
-from mammotion_webrtc.whep_server import StreamCredentials, create_whep_app
+from mammotion_webrtc.whep_server import (
+    StreamCredentials,
+    create_whep_app,
+    refresh_agora_context,
+)
 from mammotion_webrtc.go2rtc_register import Go2RTCStreamRegistrar
 
 LOGGER = logging.getLogger("mammotion_webrtc_bridge")
@@ -265,11 +269,29 @@ async def main() -> None:
         except Exception:
             LOGGER.debug("Force-join Agora channel failed", exc_info=True)
 
+    # ---- Optional aiortc relay (env MAMMOTION_RELAY_MODE=aiortc) ----
+    relay_mode = (os.getenv("MAMMOTION_RELAY_MODE", "direct") or "direct").strip().lower()
+    relay = None
+    if relay_mode == "aiortc":
+        from mammotion_webrtc.aiortc_relay import AgoraAiortcRelay
+        relay = AgoraAiortcRelay(
+            credentials_provider=credentials_provider,
+            agora_context_provider=refresh_agora_context,
+            publisher_wakeup=wake_publisher,
+        )
+        LOGGER.info("aiortc relay enabled (MAMMOTION_RELAY_MODE=aiortc)")
+    elif relay_mode != "direct":
+        LOGGER.warning(
+            "Unknown MAMMOTION_RELAY_MODE=%s; falling back to direct mode",
+            relay_mode,
+        )
+
     # ---- Start the WHEP aiohttp server (long-lived) ----
     app = create_whep_app(
         credentials_provider,
         auth_token=whep_token,
         publisher_wakeup=wake_publisher,
+        relay=relay,
     )
     runner = web.AppRunner(app)
     await runner.setup()

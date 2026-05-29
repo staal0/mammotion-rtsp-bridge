@@ -50,6 +50,7 @@ from .agora_edge import (
     RTCIceCandidateInit,
     SERVICE_IDS,
 )
+from .aiortc_relay import AgoraAiortcRelay
 
 LOGGER = logging.getLogger(__name__)
 
@@ -372,6 +373,10 @@ def _parse_trickle_candidates(sdp_fragment: str) -> list[RTCIceCandidateInit]:
 
 _MANAGER_KEY = web.AppKey("mammotion_whep_manager", MammotionWhepManager)
 _TOKEN_KEY = web.AppKey("mammotion_whep_token", object)
+# Optional aiortc-based relay. Present only when the bridge is launched in
+# relay mode (env MAMMOTION_RELAY_MODE=aiortc). When set, WHEP / WS negotiate
+# against the relay instead of building Agora-edge-pointing answers directly.
+_RELAY_KEY = web.AppKey("mammotion_aiortc_relay", AgoraAiortcRelay)
 
 # Permissive CORS so a browser WHEP test page can hit the bridge directly for
 # diagnostics. WHEP normally runs server-to-server (go2rtc → us); a browser
@@ -413,7 +418,16 @@ def _check_auth(request: web.Request) -> web.Response | None:
 
 
 async def _handle_whep_post(request: web.Request) -> web.Response:
-    """Receive go2rtc's SDP offer; return the Agora-derived SDP answer."""
+    """Receive a downstream SDP offer; return an SDP answer.
+
+    Two modes (chosen by the bridge at startup, ``MAMMOTION_RELAY_MODE``):
+
+    * **direct** (default): the answer points at Agora's edge so the consumer
+      ICEs to Agora directly. Fails with Pion-based consumers (go2rtc).
+    * **aiortc**: the bridge itself is the WebRTC peer to Agora via aiortc;
+      this answer points at the local aiortc PC. The consumer ICEs to *us*,
+      not to Agora. Works with Pion.
+    """
     auth_error = _check_auth(request)
     if auth_error is not None:
         return auth_error
@@ -431,6 +445,20 @@ async def _handle_whep_post(request: web.Request) -> web.Response:
         user_agent or "<empty>",
         pion_compat,
     )
+
+    relay = request.app.get(_RELAY_KEY)
+    if relay is not None:
+        try:
+            _pc, answer_sdp = await relay.negotiate_downstream(offer_sdp)
+        except (OSError, RuntimeError, ValueError, aiohttp.ClientError) as err:
+            LOGGER.error("Relay WHEP negotiation failed for %s: %s", stream, err)
+            return web.Response(status=502, text=str(err))
+        return web.Response(
+            status=201,
+            text=answer_sdp,
+            content_type="application/sdp",
+            headers={"Location": f"{request.path}/{secrets.token_hex(8)}"},
+        )
 
     manager = request.app[_MANAGER_KEY]
     try:
@@ -484,10 +512,14 @@ async def _handle_whep_delete(request: web.Request) -> web.Response:
 async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
     """go2rtc-compatible `/api/ws` endpoint for `webrtc:ws://.../api/ws?src=...`.
 
-    The go2rtc WS client sends `webrtc/offer` first and trickles
-    `webrtc/candidate` messages asynchronously. Our Agora join flow needs the
-    candidate list up front, so we briefly buffer trickled candidates before
-    generating the answer.
+    Two paths depending on bridge startup mode:
+
+    * **Direct mode** (no relay): go2rtc's offer is signaled into Agora's
+      join_v3; the answer points at Agora's edge. Trickled candidates are
+      buffered into the offer SDP before signaling.
+    * **Relay mode** (aiortc): we negotiate locally against an aiortc PC
+      that is fed by an upstream Agora subscription. Trickled candidates
+      go straight into the downstream aiortc PC.
     """
     auth_error = _check_auth(request)
     if auth_error is not None:
@@ -503,8 +535,10 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
-    manager = request.app[_MANAGER_KEY]
+    relay = request.app.get(_RELAY_KEY)
+    manager = request.app[_MANAGER_KEY] if relay is None else None
     current_session_id: str | None = None
+    downstream_pc = None
     pending_candidates: list[str] = []
 
     try:
@@ -523,7 +557,12 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 if not candidate.startswith("candidate:"):
                     continue
 
-                if current_session_id:
+                if relay is not None:
+                    if downstream_pc is not None:
+                        await relay.add_remote_candidate(downstream_pc, candidate)
+                    else:
+                        pending_candidates.append(candidate)
+                elif current_session_id:
                     await manager.add_session_candidate(
                         stream,
                         current_session_id,
@@ -546,6 +585,24 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 )
                 continue
 
+            if relay is not None:
+                try:
+                    downstream_pc, answer_sdp = await relay.negotiate_downstream(
+                        offer_sdp
+                    )
+                except Exception as err:  # noqa: BLE001
+                    LOGGER.error("Relay WS negotiation failed for %s: %s", stream, err)
+                    await ws.send_json({"type": "error", "value": f"webrtc/offer: {err}"})
+                    continue
+                await ws.send_json({"type": "webrtc/answer", "value": answer_sdp})
+                LOGGER.info("Relay WS session established stream=%s", stream)
+                # Drain any candidates buffered before the offer arrived.
+                while pending_candidates:
+                    await relay.add_remote_candidate(
+                        downstream_pc, pending_candidates.pop(0)
+                    )
+                continue
+
             if pending_candidates:
                 trickle_lines = [f"a={candidate}" for candidate in pending_candidates]
                 offer_sdp = offer_sdp.rstrip() + "\r\n" + "\r\n".join(trickle_lines) + "\r\n"
@@ -564,7 +621,9 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 LOGGER.error("go2rtc WS negotiation failed for %s: %s", stream, err)
                 await ws.send_json({"type": "error", "value": f"webrtc/offer: {err}"})
     finally:
-        if current_session_id:
+        if relay is not None and downstream_pc is not None:
+            await relay.close_downstream(downstream_pc)
+        elif current_session_id and manager is not None:
             await manager.close_session(stream)
 
     return ws
@@ -575,6 +634,7 @@ def create_whep_app(
     *,
     auth_token: str | None = None,
     publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
+    relay: AgoraAiortcRelay | None = None,
 ) -> web.Application:
     """Build the standalone aiohttp WHEP application.
 
@@ -582,6 +642,10 @@ def create_whep_app(
       * ``POST   /whep/{stream}``                  -> negotiate (offer->answer)
       * ``PATCH  /whep/{stream}/{session_id}``     -> trickle ICE
       * ``DELETE /whep/{stream}/{session_id}``     -> teardown
+      * ``GET    /api/ws``                         -> go2rtc-compat WS signaling
+
+    When ``relay`` is provided, the WHEP/WS handlers route through the
+    aiortc relay instead of building Agora-edge-pointing answers directly.
     """
     app = web.Application(middlewares=[_cors_middleware])
     manager = MammotionWhepManager(
@@ -590,6 +654,8 @@ def create_whep_app(
     )
     app[_MANAGER_KEY] = manager
     app[_TOKEN_KEY] = auth_token
+    if relay is not None:
+        app[_RELAY_KEY] = relay
 
     app.router.add_post("/whep/{stream}", _handle_whep_post)
     app.router.add_patch("/whep/{stream}/{session_id}", _handle_whep_patch)
@@ -597,6 +663,8 @@ def create_whep_app(
     app.router.add_get("/api/ws", _handle_go2rtc_ws)
 
     async def _on_cleanup(_app: web.Application) -> None:
+        if relay is not None:
+            await relay.close()
         await manager.close_all()
 
     app.on_cleanup.append(_on_cleanup)
