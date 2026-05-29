@@ -155,8 +155,10 @@ class AgoraAiortcRelay:
         except Exception:  # noqa: BLE001
             LOGGER.exception("Failed to parse downstream ICE candidate: %s", raw)
             return
-        if sdp_m_line_index is not None:
-            candidate.sdpMLineIndex = sdp_m_line_index
+        # aiortc requires at least one of sdpMid / sdpMLineIndex. go2rtc's WS
+        # protocol omits both, so default to mLineIndex=0 (works with BUNDLE'd
+        # PCs where everything shares one transport).
+        candidate.sdpMLineIndex = sdp_m_line_index if sdp_m_line_index is not None else 0
         if sdp_mid is not None:
             candidate.sdpMid = sdp_mid
         try:

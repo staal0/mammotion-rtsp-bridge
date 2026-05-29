@@ -621,9 +621,12 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 LOGGER.error("go2rtc WS negotiation failed for %s: %s", stream, err)
                 await ws.send_json({"type": "error", "value": f"webrtc/offer: {err}"})
     finally:
-        if relay is not None and downstream_pc is not None:
-            await relay.close_downstream(downstream_pc)
-        elif current_session_id and manager is not None:
+        # In relay mode we deliberately DO NOT close the downstream PC when
+        # the signaling WS closes: go2rtc closes the WS right after the offer/
+        # answer/trickle exchange completes (normal WebRTC behavior). The PC
+        # itself stays alive until its own connectionstatechange fires
+        # closed/failed/disconnected, at which point the relay tears it down.
+        if relay is None and current_session_id and manager is not None:
             await manager.close_session(stream)
 
     return ws
