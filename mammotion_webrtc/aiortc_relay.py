@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamTrack
@@ -68,6 +69,7 @@ class AgoraToRtspRelay:
         upstream_track_timeout_seconds: float = 15.0,
         reconnect_backoff_seconds: float = 5.0,
         max_reconnect_backoff_seconds: float = 60.0,
+        no_rtp_watchdog_seconds: float = 30.0,
     ) -> None:
         self._credentials_provider = credentials_provider
         self._agora_context_provider = agora_context_provider
@@ -76,6 +78,7 @@ class AgoraToRtspRelay:
         self._upstream_track_timeout = upstream_track_timeout_seconds
         self._reconnect_backoff = reconnect_backoff_seconds
         self._max_reconnect_backoff = max_reconnect_backoff_seconds
+        self._no_rtp_watchdog = no_rtp_watchdog_seconds
 
         self._stop_event = asyncio.Event()
         self._upstream_pc: RTCPeerConnection | None = None
@@ -89,6 +92,10 @@ class AgoraToRtspRelay:
         self._video_ssrc: int | None = None
         # Set when the upstream PC reaches "connected"; cleared on teardown.
         self._upstream_ready = asyncio.Event()
+        # Monotonic-ns timestamp of the last forwarded H265 RTP packet. Used
+        # by the no-RTP watchdog to detect a publisher that has gone silent
+        # while the ICE/DTLS connection is still nominally healthy.
+        self._last_rtp_ns: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -243,17 +250,41 @@ class AgoraToRtspRelay:
 
         LOGGER.info("Upstream ready (session=%s); pumping RTP to RTSP server", session_id)
 
-        # Hold until the connection dies or we are asked to stop. The actual
-        # RTP forwarding happens in the receiver-hook coroutine; this task
-        # just waits.
+        # Reset the watchdog clock at the moment we're ready to receive. Some
+        # initial silence is normal while the publisher uploads parameter sets
+        # and the first IDR; the watchdog only fires if the silence persists.
+        self._last_rtp_ns = time.monotonic_ns()
+
+        async def _no_rtp_watchdog() -> None:
+            # Poll twice per window so the worst-case detection latency is
+            # ~0.5 * window and we don't spin too aggressively.
+            interval = max(1.0, self._no_rtp_watchdog / 2)
+            threshold_ns = int(self._no_rtp_watchdog * 1e9)
+            while True:
+                await asyncio.sleep(interval)
+                idle_ns = time.monotonic_ns() - self._last_rtp_ns
+                if idle_ns >= threshold_ns:
+                    LOGGER.warning(
+                        "No upstream RTP for %.1fs (publisher likely stalled); "
+                        "tearing down to force reconnect",
+                        idle_ns / 1e9,
+                    )
+                    connection_failed.set()
+                    return
+
+        # Hold until the connection dies, the watchdog fires, or we are asked
+        # to stop. The actual RTP forwarding happens in the receiver-hook
+        # coroutine; this task just supervises.
         stop_wait = asyncio.create_task(self._stop_event.wait())
         failed_wait = asyncio.create_task(connection_failed.wait())
+        watchdog_task = asyncio.create_task(_no_rtp_watchdog())
         try:
             await asyncio.wait(
-                {stop_wait, failed_wait}, return_when=asyncio.FIRST_COMPLETED
+                {stop_wait, failed_wait, watchdog_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            for task in (stop_wait, failed_wait):
+            for task in (stop_wait, failed_wait, watchdog_task):
                 if not task.done():
                     task.cancel()
 
@@ -305,6 +336,7 @@ class AgoraToRtspRelay:
                     if relay_self._video_ssrc is None:
                         relay_self._video_ssrc = effective.ssrc
                     if effective.payload:
+                        relay_self._last_rtp_ns = time.monotonic_ns()
                         rtsp_server.push_rtp(
                             payload=bytes(effective.payload),
                             timestamp=effective.timestamp,

@@ -6,6 +6,25 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-30
+
+### Added
+- No-RTP watchdog (`MAMMOTION_NO_RTP_WATCHDOG_SECONDS`, default 30 s). If the
+  upstream ICE/DTLS session stays "connected" but no H265 RTP packet arrives
+  for the configured window, the bridge tears down the upstream and lets the
+  supervisor reconnect — which refetches credentials and re-triggers the
+  mower to publish. Fixes the silent-stall mode where the publisher would
+  back off after a few minutes and the bridge would happily sit on a dead
+  session until the hourly token expiry forced a reconnect.
+
+### Changed
+- `MAMMOTION_KEEPALIVE_SECONDS` default raised from 10 s to 300 s. The old
+  cadence sent ~8640 MQTT messages per day; pymammotion's Aliyun MQTT
+  transport self-imposes a ~300/24 h cap, so the bridge would hit the limit
+  ~50 min in and then silently stop nudging the mower. 5 min cadence keeps
+  the bridge well under the cap and the no-RTP watchdog handles the case
+  where the publisher times out anyway.
+
 ## [0.1.3] - 2026-05-29
 
 ### Changed
@@ -73,7 +92,8 @@ First public release. Experimental.
 - Example configs for Frigate and standalone go2rtc, plus a documented HA
   advanced-camera-card snippet.
 
-[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.4
 [0.1.3]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.3
 [0.1.2]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.2
 [0.1.1]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.1

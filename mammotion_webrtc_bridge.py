@@ -27,7 +27,10 @@ Environment variables:
   MAMMOTION_STREAM_NAME                    - go2rtc stream name (default mammotion)
   GO2RTC_API_URL                           - go2rtc REST base (default http://frigate:1984)
   MAMMOTION_GO2RTC_RECONCILE_SECONDS       - periodic re-register interval (default 20)
-  MAMMOTION_KEEPALIVE_SECONDS              - MQTT keep-alive interval (default 10)
+  MAMMOTION_KEEPALIVE_SECONDS              - MQTT keep-alive interval (default 300)
+  MAMMOTION_NO_RTP_WATCHDOG_SECONDS        - tear down upstream + reconnect if no
+                                             H265 RTP packet for this many seconds
+                                             (default 30)
   MAMMOTION_RECONNECT_BACKOFF_SECONDS      - login retry backoff (default 8)
 """
 
@@ -136,7 +139,7 @@ async def main() -> None:
     go2rtc_api_url = os.getenv("GO2RTC_API_URL", "http://frigate:1984")
     stream_name = os.getenv("MAMMOTION_STREAM_NAME", "mammotion")
     go2rtc_reconcile_interval = float(_env_int("MAMMOTION_GO2RTC_RECONCILE_SECONDS", 20))
-    keepalive_interval = float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 10))
+    keepalive_interval = float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 300))
     reconnect_backoff = _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8)
 
     rtsp_source = f"rtsp://{rtsp_host}:{rtsp_port}/{stream_name}"
@@ -261,6 +264,9 @@ async def main() -> None:
         agora_context_provider=refresh_agora_context,
         rtsp_server=rtsp_server,
         publisher_wakeup=wake_publisher,
+        no_rtp_watchdog_seconds=float(
+            _env_int("MAMMOTION_NO_RTP_WATCHDOG_SECONDS", 30)
+        ),
     )
     # Wire the RTSP server's "new viewer connected" hook back to the relay
     # so we can opportunistically PLI Agora for a fresh keyframe — without

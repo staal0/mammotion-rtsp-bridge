@@ -73,7 +73,8 @@ docker compose up -d mammotion-bridge
 | `MAMMOTION_RTSP_PORT` | `8554` | RTSP listen port inside the container |
 | `MAMMOTION_RTSP_BIND` | `0.0.0.0` | RTSP bind address |
 | `MAMMOTION_GO2RTC_RECONCILE_SECONDS` | `20` | Periodic go2rtc registration self-heal interval |
-| `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keepalive cadence to the mower |
+| `MAMMOTION_KEEPALIVE_SECONDS` | `300` | MQTT keepalive cadence to the mower (stay under pymammotion's 300/24h cap) |
+| `MAMMOTION_NO_RTP_WATCHDOG_SECONDS` | `30` | Tear down + reconnect the Agora session if no H265 RTP arrives for this long |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Retry delay on cloud/session failure |
 | `MAMMOTION_LOG_LEVEL` | `INFO` | `DEBUG` exposes RTSP method exchange and signaling traces |
 
@@ -94,9 +95,14 @@ The bridge serves a plain RTP-over-RTSP H265 stream. Consumers tested:
 - The Agora subscription is self-healing with bounded backoff. If the upstream
   WebRTC connection fails, the bridge tears it down and reconnects, refetching
   cloud credentials so expired tokens are handled implicitly.
-- The bridge proactively keeps the mower publishing (MQTT
-  `send_todev_ble_sync` + `device_agora_join_channel_with_position`) — the
-  publisher otherwise times out roughly every 50 s and stops sending video.
+- A no-RTP watchdog (default 30 s) detects the case where the ICE/DTLS session
+  stays nominally healthy but the mower's publisher has gone silent. When that
+  happens the bridge tears down the upstream and lets the supervisor reconnect
+  — which fetches fresh credentials and re-triggers the mower to publish.
+- MQTT keepalive cadence is conservative (default 5 min) because pymammotion's
+  Aliyun MQTT transport caps the bridge at ~300 sends/24 h. The publisher is
+  kept alive primarily by remaining subscribed as an Agora audience client,
+  not by aggressive MQTT pings.
 - go2rtc registration is reconciled periodically, so the stream comes back on
   its own after a Frigate restart.
 - A fresh Mammotion login is performed per cycle so a stale cloud token can't
