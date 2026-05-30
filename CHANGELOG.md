@@ -6,6 +6,21 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-30
+
+### Fixed
+- Drop the early-SDP fallback in `agora_edge` that fired on
+  `on_add_video_stream` timeout. The fallback built an answer SDP without the
+  publisher's actual SSRC/PT, which silently broke codec routing in the
+  aiortc receiver (`codecs_by_pt` lookup misses → RTP tap drops every
+  packet → watchdog fires → reconnect → same timeout → infinite loop).
+  Raising on timeout instead lets the supervisor back off and retry cleanly.
+- Re-tag `:stable` to the actual newest code. After the v0.1.2/3/4 history
+  rewrite, parallel CI builds for all three retagged versions raced for the
+  `:stable` floating tag and v0.1.2 (WHEP bridge code) won, leaving `:stable`
+  serving the old WHEP signaling bridge. v0.1.5 is unambiguously the newest
+  tag so CI publishes the aiortc relay code as `:stable`.
+
 ## [0.1.4] - 2026-05-30
 
 ### Added
@@ -92,7 +107,8 @@ First public release. Experimental.
 - Example configs for Frigate and standalone go2rtc, plus a documented HA
   advanced-camera-card snippet.
 
-[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.5
 [0.1.4]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.4
 [0.1.3]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.3
 [0.1.2]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.2
