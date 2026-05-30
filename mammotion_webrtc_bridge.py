@@ -31,6 +31,9 @@ Environment variables:
   MAMMOTION_NO_RTP_WATCHDOG_SECONDS        - tear down upstream + reconnect if no
                                              H265 RTP packet for this many seconds
                                              (default 30)
+  MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS    - on stall, wait this long after a
+                                             refresh_fpv before escalating to a
+                                             full teardown (default 10)
   MAMMOTION_RECONNECT_BACKOFF_SECONDS      - login retry backoff (default 8)
 """
 
@@ -226,12 +229,43 @@ async def main() -> None:
                 raise
         return state["credentials"]
 
+    async def _refresh_fpv() -> bool:
+        """Tell the mower's multimedia SoC to re-enable the encode stream.
+
+        Sends ``MulSetEncode(encode=True)`` via pymammotion's ``refresh_fpv``
+        command. This is the camera-specific keep-alive — distinct from the
+        BLE telemetry RPT_KEEP that pymammotion's polling loop fires for the
+        device-status report stream. If the encoder has gone idle (the
+        ``connected but no RTP`` failure mode) this is the cheapest possible
+        recovery: one MQTT message, no full Agora reconnect.
+
+        Returns True if the command was sent, False if pymammotion didn't
+        expose the command (older release) or the send failed. Best-effort.
+        """
+        mammotion = state["mammotion"]
+        device = state.get("device_name")
+        if mammotion is None or not device:
+            return False
+        try:
+            await mammotion.send_command_with_args(device, "refresh_fpv")
+            return True
+        except AttributeError:
+            LOGGER.debug(
+                "refresh_fpv not available in this pymammotion version", exc_info=True
+            )
+            return False
+        except Exception:
+            LOGGER.debug("refresh_fpv send failed", exc_info=True)
+            return False
+
     async def wake_publisher() -> None:
         """Force the mower into the Agora channel with video on.
 
-        ``send_todev_ble_sync`` with ``sync_type=3`` is Mammotion's BLE wake.
-        ``device_agora_join_channel_with_position`` with ``enter_state=1``
-        is the explicit "join Agora, video on" command. Both are best-effort.
+        ``send_todev_ble_sync sync_type=3`` is Mammotion's BLE wake.
+        ``device_agora_join_channel_with_position enter_state=1`` is the
+        explicit "join Agora, video on" command. ``refresh_fpv`` then
+        re-enables the multimedia SoC's encode stream so the camera
+        actually starts producing frames. All three are best-effort.
         """
         mammotion = state["mammotion"]
         device = state.get("device_name")
@@ -251,6 +285,7 @@ async def main() -> None:
             )
         except Exception:
             LOGGER.debug("Force-join Agora channel failed", exc_info=True)
+        await _refresh_fpv()
 
     # Construct the RTSP server now so the relay can hold a reference even
     # before we know the port is bound — start()/stop() are explicit below.
@@ -264,8 +299,12 @@ async def main() -> None:
         agora_context_provider=refresh_agora_context,
         rtsp_server=rtsp_server,
         publisher_wakeup=wake_publisher,
+        cheap_recovery=_refresh_fpv,
         no_rtp_watchdog_seconds=float(
             _env_int("MAMMOTION_NO_RTP_WATCHDOG_SECONDS", 30)
+        ),
+        cheap_recovery_wait_seconds=float(
+            _env_int("MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS", 10)
         ),
     )
     # Wire the RTSP server's "new viewer connected" hook back to the relay
@@ -361,19 +400,28 @@ async def main() -> None:
                 next_go2rtc_reconcile = now + go2rtc_reconcile_interval
 
             if now >= next_keepalive:
-                try:
-                    await mammotion.send_command_with_args(
-                        state["device_name"], "send_todev_ble_sync", sync_type=2
-                    )
-                except Exception:
-                    LOGGER.debug("Keep-alive sync failed", exc_info=True)
-                    # A failing keep-alive usually means a dead cloud session.
-                    # Drop the client; the loop re-logs in on the next tick.
+                # Periodic keep-alive. ``refresh_fpv`` is the right tool: it
+                # tells the multimedia SoC to keep the encoder enabled, which
+                # is what actually keeps video flowing on Agora. Fall back to
+                # the lightweight ``ble_sync sync_type=2`` if pymammotion is
+                # too old to expose refresh_fpv — at least that keeps the
+                # cloud session warm so the supervisor's reconnect path stays
+                # available.
+                sent = await _refresh_fpv()
+                if not sent:
                     try:
-                        await mammotion.stop()
+                        await mammotion.send_command_with_args(
+                            state["device_name"], "send_todev_ble_sync", sync_type=2
+                        )
                     except Exception:
-                        pass
-                    state["mammotion"] = None
+                        LOGGER.debug("Keep-alive sync failed", exc_info=True)
+                        # A failing keep-alive usually means a dead cloud
+                        # session. Drop the client; the loop re-logs in.
+                        try:
+                            await mammotion.stop()
+                        except Exception:
+                            pass
+                        state["mammotion"] = None
                 next_keepalive = now + keepalive_interval
 
             try:

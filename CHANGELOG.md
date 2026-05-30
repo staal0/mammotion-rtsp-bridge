@@ -6,6 +6,30 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-05-30
+
+### Added
+- Wire pymammotion's `refresh_fpv` (`MulSetEncode(encode=True)`) in as the
+  camera-specific keep-alive. Three integration points:
+  - `wake_publisher` now sends `refresh_fpv` after the
+    `device_agora_join_channel_with_position`, so every upstream reconnect
+    explicitly re-enables the encoder.
+  - The periodic keep-alive loop calls `refresh_fpv` instead of the generic
+    `send_todev_ble_sync sync_type=2` (which only kept the cloud session
+    warm and didn't touch the encoder). Falls back to the old command if
+    pymammotion is too old to expose `refresh_fpv`.
+  - The no-RTP watchdog now tries `refresh_fpv` first as a cheap recovery
+    (`MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS`, default 10 s) and only
+    escalates to full teardown + reconnect if RTP doesn't resume. This
+    eliminates most of the reconnect churn that was burning the MQTT budget.
+
+### Why
+`send_todev_ble_sync sync_type=2` is a generic Aliyun MQTT heartbeat, not
+a camera command. The mower's multimedia SoC was going idle even while we
+were sending those pings. `refresh_fpv` targets the actual encoder.
+Surfaced by reading Mikey's recent pymammotion additions
+([`pymammotion/mammotion/commands/messages/video.py:48`](pymammotion/mammotion/commands/messages/video.py#L48)).
+
 ## [0.1.5] - 2026-05-30
 
 ### Fixed
@@ -107,7 +131,8 @@ First public release. Experimental.
 - Example configs for Frigate and standalone go2rtc, plus a documented HA
   advanced-camera-card snippet.
 
-[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.6
 [0.1.5]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.5
 [0.1.4]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.4
 [0.1.3]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.3

@@ -66,19 +66,26 @@ class AgoraToRtspRelay:
         agora_context_provider: AgoraContextProvider,
         rtsp_server: Go2RtcRtspStream,
         publisher_wakeup: PublisherWakeup = None,
+        cheap_recovery: PublisherWakeup = None,
         upstream_track_timeout_seconds: float = 15.0,
         reconnect_backoff_seconds: float = 5.0,
         max_reconnect_backoff_seconds: float = 60.0,
         no_rtp_watchdog_seconds: float = 30.0,
+        cheap_recovery_wait_seconds: float = 10.0,
     ) -> None:
         self._credentials_provider = credentials_provider
         self._agora_context_provider = agora_context_provider
         self._rtsp_server = rtsp_server
         self._publisher_wakeup = publisher_wakeup
+        # Best-effort "nudge the publisher without tearing down the upstream"
+        # callback. The watchdog fires this first; only if RTP doesn't resume
+        # within cheap_recovery_wait_seconds do we escalate to full teardown.
+        self._cheap_recovery = cheap_recovery
         self._upstream_track_timeout = upstream_track_timeout_seconds
         self._reconnect_backoff = reconnect_backoff_seconds
         self._max_reconnect_backoff = max_reconnect_backoff_seconds
         self._no_rtp_watchdog = no_rtp_watchdog_seconds
+        self._cheap_recovery_wait = cheap_recovery_wait_seconds
 
         self._stop_event = asyncio.Event()
         self._upstream_pc: RTCPeerConnection | None = None
@@ -260,17 +267,54 @@ class AgoraToRtspRelay:
             # ~0.5 * window and we don't spin too aggressively.
             interval = max(1.0, self._no_rtp_watchdog / 2)
             threshold_ns = int(self._no_rtp_watchdog * 1e9)
+            tried_cheap_recovery = False
             while True:
                 await asyncio.sleep(interval)
                 idle_ns = time.monotonic_ns() - self._last_rtp_ns
-                if idle_ns >= threshold_ns:
-                    LOGGER.warning(
-                        "No upstream RTP for %.1fs (publisher likely stalled); "
-                        "tearing down to force reconnect",
+                if idle_ns < threshold_ns:
+                    # Stream healthy; if we'd previously tried a cheap
+                    # recovery, reset the flag so a future stall gets one too.
+                    tried_cheap_recovery = False
+                    continue
+
+                # Stalled. First try a cheap recovery (refresh_fpv) — one
+                # MQTT message vs. tearing down the upstream + new Agora
+                # session + fresh credentials. Only escalate if that doesn't
+                # restore RTP within cheap_recovery_wait_seconds.
+                if (
+                    not tried_cheap_recovery
+                    and self._cheap_recovery is not None
+                ):
+                    LOGGER.info(
+                        "No upstream RTP for %.1fs; trying cheap recovery "
+                        "(refresh_fpv) before teardown",
                         idle_ns / 1e9,
                     )
-                    connection_failed.set()
-                    return
+                    tried_cheap_recovery = True
+                    try:
+                        await self._cheap_recovery()
+                    except Exception:  # noqa: BLE001
+                        LOGGER.debug("cheap recovery raised", exc_info=True)
+                    # Give the mower a chance to react. Check RTP after the
+                    # configured wait — if it resumed, the next loop iter
+                    # sees idle_ns under threshold and resets the flag.
+                    await asyncio.sleep(self._cheap_recovery_wait)
+                    if time.monotonic_ns() - self._last_rtp_ns < threshold_ns:
+                        LOGGER.info("Cheap recovery worked — RTP resumed")
+                        tried_cheap_recovery = False
+                        continue
+                    LOGGER.warning(
+                        "Cheap recovery didn't restore RTP; escalating to "
+                        "full teardown"
+                    )
+
+                LOGGER.warning(
+                    "No upstream RTP for %.1fs (publisher likely stalled); "
+                    "tearing down to force reconnect",
+                    (time.monotonic_ns() - self._last_rtp_ns) / 1e9,
+                )
+                connection_failed.set()
+                return
 
         # Hold until the connection dies, the watchdog fires, or we are asked
         # to stop. The actual RTP forwarding happens in the receiver-hook
