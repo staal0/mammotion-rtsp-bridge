@@ -6,6 +6,33 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-05-31
+
+### Changed
+- Split the relay supervisor's backoff into two regimes based on whether
+  any H265 RTP packet arrived during the cycle:
+  - **Publisher stall** (we had RTP, then it stopped) — always retry at the
+    immediate `reconnect_backoff_seconds` (1 s). Sub-15 s recovery preserved.
+  - **Mower offline** (no RTP this cycle — Agora signaling timeouts,
+    "device not responding" from cloud, no `on_user_online`, etc.) —
+    exponential ramp up to `max_reconnect_backoff_seconds`. We don't burn
+    the pymammotion 300/24h MQTT budget hammering a sleeping mower.
+- Raised `max_reconnect_backoff_seconds` from 10 s back to 60 s. The cap
+  is now only relevant for the offline path; stalls always use 1 s, so
+  this no longer slows down legitimate recovery.
+
+### Added
+- New log lines that explicitly distinguish the two failure modes:
+  - `INFO  Publisher stalled mid-stream; retrying in 1.0s`
+  - `WARNING Mower appears offline (no video received this cycle); backing off 4.0s (next attempt's backoff: 8.0s)`
+
+### Why
+v0.1.8's tuning made stall recovery fast, but the same fast path was also
+used when the mower itself was offline — burning MQTT budget and stack-
+tracing every cycle without any hope of recovery. The phone app is
+genuinely unreachable in the same scenarios; sustained Agora hammering
+doesn't make our bridge more capable than the official app.
+
 ## [0.1.8] - 2026-05-30
 
 ### Changed
@@ -168,7 +195,8 @@ First public release. Experimental.
 - Example configs for Frigate and standalone go2rtc, plus a documented HA
   advanced-camera-card snippet.
 
-[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.9
 [0.1.8]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.8
 [0.1.7]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.7
 [0.1.6]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.6

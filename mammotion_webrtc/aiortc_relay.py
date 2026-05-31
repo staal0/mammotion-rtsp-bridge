@@ -69,7 +69,7 @@ class AgoraToRtspRelay:
         cheap_recovery: PublisherWakeup = None,
         upstream_track_timeout_seconds: float = 15.0,
         reconnect_backoff_seconds: float = 1.0,
-        max_reconnect_backoff_seconds: float = 10.0,
+        max_reconnect_backoff_seconds: float = 60.0,
         no_rtp_watchdog_seconds: float = 5.0,
         cheap_recovery_wait_seconds: float = 3.0,
     ) -> None:
@@ -146,21 +146,52 @@ class AgoraToRtspRelay:
     # ------------------------------------------------------------------
 
     async def _supervise(self) -> None:
-        backoff = self._reconnect_backoff
+        # Two backoff regimes, picked per cycle by whether any H265 RTP packet
+        # arrived this round:
+        #
+        #   * Publisher stall (we did get RTP, then it stopped) — fast recovery
+        #     at the immediate ``reconnect_backoff_seconds``. The mower is
+        #     reachable, just paused; we want a sub-15s gap.
+        #   * Mower offline (no RTP at all — Agora signaling timeouts, "device
+        #     not responding" from cloud, etc.) — exponential ramp up to
+        #     ``max_reconnect_backoff_seconds``. Hammering MQTT/Agora doesn't
+        #     wake a sleeping mower and burns the pymammotion 300/24h budget.
+        offline_backoff = self._reconnect_backoff
         while not self._stop_event.is_set():
+            got_rtp_this_cycle = False
             try:
                 await self._run_one_upstream()
-                # Clean exit (upstream disconnected on its own). Reset backoff
-                # so a steady-state churn does not push retry delay up.
-                backoff = self._reconnect_backoff
             except asyncio.CancelledError:
                 return
             except Exception:  # noqa: BLE001
-                LOGGER.exception(
-                    "Upstream connection failed; will retry in %.1fs", backoff
-                )
+                LOGGER.exception("Upstream connection failed")
             finally:
+                # _video_ssrc is set by the RTP tap on the first H265 packet
+                # of a cycle and cleared by _teardown_upstream — so we have to
+                # capture it before teardown runs.
+                got_rtp_this_cycle = self._video_ssrc is not None
                 await self._teardown_upstream()
+
+            if got_rtp_this_cycle:
+                # Publisher stall — reset the offline ramp and retry fast.
+                backoff = self._reconnect_backoff
+                offline_backoff = self._reconnect_backoff
+                LOGGER.info(
+                    "Publisher stalled mid-stream; retrying in %.1fs", backoff
+                )
+            else:
+                # No video this cycle. Mower likely offline or refusing to
+                # publish. Use the ramped backoff, then escalate for next time.
+                backoff = offline_backoff
+                offline_backoff = min(
+                    offline_backoff * 2, self._max_reconnect_backoff
+                )
+                LOGGER.warning(
+                    "Mower appears offline (no video received this cycle); "
+                    "backing off %.1fs (next attempt's backoff: %.1fs)",
+                    backoff,
+                    offline_backoff,
+                )
 
             if self._stop_event.is_set():
                 return
@@ -170,7 +201,6 @@ class AgoraToRtspRelay:
                 return
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, self._max_reconnect_backoff)
 
     async def _run_one_upstream(self) -> None:
         """Bring up one Agora subscription and pump RTP until it dies."""
