@@ -6,6 +6,29 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-06-01
+
+### Added
+- In-process dryness watchdog: if `relay.seconds_since_last_rtp` exceeds
+  `MAMMOTION_DRY_RESTART_SECONDS` (default `180`), the bridge tears the
+  whole session down (relay, RTSP server, pymammotion client) and
+  re-bootstraps from a fresh cloud login inside the same process. Closes
+  the "stuck for hours, only `docker restart` fixes it" failure mode that
+  the in-relay reconnect loop could not escape because cred-refresh on a
+  stale pymammotion/MQTT session no longer wakes the mower.
+
+### Changed
+- `main()` refactored into an outer retry loop plus a new
+  `_run_bridge_session()` inner function. All resources allocated in a
+  session are released in its `finally` block before the watchdog
+  exception propagates, so the in-process restart never leaks the
+  upstream PC, RTSP listener, or cloud client. No `sys.exit` / `os._exit`
+   — recovery works regardless of the container's restart policy.
+- `AgoraToRtspRelay._last_rtp_ns` now initialised to `monotonic_ns()` at
+  construction (was `0`) so a bootstrap that never produces video also
+  ages out, and a public `seconds_since_last_rtp` property exposes the
+  age in seconds for the bridge-level watchdog to consume.
+
 ## [0.1.9] - 2026-05-31
 
 ### Changed
