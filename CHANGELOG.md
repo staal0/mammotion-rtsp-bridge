@@ -6,6 +6,14 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-06-01
+
+### Added
+- Log the bridge version on startup. `mammotion_webrtc.__version__` is
+  the single source of truth and is bumped per release together with the
+  git tag, so the running container's version is visible in the very
+  first INFO line.
+
 ## [0.1.10] - 2026-06-01
 
 ### Added
