@@ -100,13 +100,29 @@ class AgoraToRtspRelay:
         # Set when the upstream PC reaches "connected"; cleared on teardown.
         self._upstream_ready = asyncio.Event()
         # Monotonic-ns timestamp of the last forwarded H265 RTP packet. Used
-        # by the no-RTP watchdog to detect a publisher that has gone silent
-        # while the ICE/DTLS connection is still nominally healthy.
-        self._last_rtp_ns: int = 0
+        # by the in-relay no-RTP watchdog (tears down + reconnects) AND by
+        # the bridge-level dryness watchdog (restarts the whole process when
+        # in-relay recovery has stopped working — see seconds_since_last_rtp).
+        # Initialised to "now" so a bootstrap that never produces video also
+        # ages out, instead of looking infinitely stale from t=0.
+        self._last_rtp_ns: int = time.monotonic_ns()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def seconds_since_last_rtp(self) -> float:
+        """Wall-clock seconds since the last forwarded H265 RTP packet.
+
+        Survives reconnect cycles: the timestamp is only updated by the RTP
+        tap (and once at construction), never reset by teardown. The bridge
+        uses this to drive a process-level dryness watchdog that escapes the
+        "publisher unreachable for hours" failure mode the in-relay
+        reconnect loop can't dig itself out of (stale pymammotion session,
+        stuck MQTT, mower needing a full cloud-side wake).
+        """
+        return (time.monotonic_ns() - self._last_rtp_ns) / 1e9
 
     async def start(self) -> None:
         if self._supervisor_task is not None and not self._supervisor_task.done():

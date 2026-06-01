@@ -24,6 +24,12 @@ xdump_config
 Mammotion-HA-main/
 PyMammotion-main/
 homeassistant_petkit-main/
+agora-rtc-web-main/
+go2rtc-master/
+
+# Local browser-side scratch pages used to test WebRTC paths from the host
+wheptest.html
+wstest.html
 
 # IDE / OS
 .idea/

@@ -34,6 +34,18 @@ Environment variables:
   MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS    - on stall, wait this long after a
                                              refresh_fpv before escalating to a
                                              full teardown (default 3)
+  MAMMOTION_DRY_RESTART_SECONDS            - if no H265 RTP at all for this many
+                                             consecutive seconds, tear down the
+                                             WHOLE bridge in-process (relay +
+                                             RTSP + pymammotion login) and
+                                             re-bootstrap from scratch. Escapes
+                                             the "stuck for hours" failure mode
+                                             where the in-relay reconnect loop
+                                             can't wake the publisher because
+                                             of a stale cloud session.
+                                             Default 180. Works without any
+                                             docker restart policy — no process
+                                             exit, just an in-process reset.
   MAMMOTION_RECONNECT_BACKOFF_SECONDS      - login retry backoff (default 8)
 """
 
@@ -121,6 +133,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+class _DryWatchdogTripped(Exception):
+    """Internal signal: no H265 RTP for too long → full in-process restart.
+
+    Raised from the keep-alive loop when ``relay.seconds_since_last_rtp``
+    exceeds ``MAMMOTION_DRY_RESTART_SECONDS``. The outer ``main`` loop
+    catches it, tears down the current session (relay, RTSP server,
+    pymammotion client), and re-enters :func:`_run_bridge_session` with
+    a fully fresh state. Never propagates out of ``main``.
+    """
+
+
 async def main() -> None:
     log_level = os.getenv("MAMMOTION_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -136,16 +159,44 @@ async def main() -> None:
             "Missing Mammotion credentials. Set MAMMOTION_EMAIL/MAMMOTION_PASSWORD."
         )
 
-    rtsp_port = _env_int("MAMMOTION_RTSP_PORT", 8554)
-    rtsp_bind = os.getenv("MAMMOTION_RTSP_BIND", "0.0.0.0")
-    rtsp_host = os.getenv("MAMMOTION_RTSP_HOST", socket.gethostname())
-    go2rtc_api_url = os.getenv("GO2RTC_API_URL", "http://frigate:1984")
-    stream_name = os.getenv("MAMMOTION_STREAM_NAME", "mammotion")
-    go2rtc_reconcile_interval = float(_env_int("MAMMOTION_GO2RTC_RECONCILE_SECONDS", 20))
-    keepalive_interval = float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 300))
-    reconnect_backoff = _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8)
-
-    rtsp_source = f"rtsp://{rtsp_host}:{rtsp_port}/{stream_name}"
+    config = {
+        "email": email,
+        "password": password,
+        "device_name": device_name,
+        "rtsp_port": _env_int("MAMMOTION_RTSP_PORT", 8554),
+        "rtsp_bind": os.getenv("MAMMOTION_RTSP_BIND", "0.0.0.0"),
+        "rtsp_host": os.getenv("MAMMOTION_RTSP_HOST", socket.gethostname()),
+        "go2rtc_api_url": os.getenv("GO2RTC_API_URL", "http://frigate:1984"),
+        "stream_name": os.getenv("MAMMOTION_STREAM_NAME", "mammotion"),
+        "go2rtc_reconcile_interval": float(
+            _env_int("MAMMOTION_GO2RTC_RECONCILE_SECONDS", 20)
+        ),
+        "keepalive_interval": float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 300)),
+        "reconnect_backoff": _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8),
+        "no_rtp_watchdog_seconds": float(
+            _env_int("MAMMOTION_NO_RTP_WATCHDOG_SECONDS", 5)
+        ),
+        "cheap_recovery_wait_seconds": float(
+            _env_int("MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS", 3)
+        ),
+        # Dryness watchdog: when the in-relay reconnect loop has been unable
+        # to fetch a single H265 packet for this many consecutive seconds,
+        # we tear the WHOLE bridge down in-process (relay, RTSP server,
+        # pymammotion client) and re-bootstrap from a fresh login. The
+        # in-relay watchdog already handles short publisher stalls
+        # (~5-10s); this one is the escape from "stuck for hours" failure
+        # modes — typically a stale pymammotion/MQTT session that needs a
+        # clean re-login. Set high enough that ordinary publisher stalls
+        # don't trigger it.
+        #
+        # In-process restart works without any container restart policy.
+        # We deliberately do NOT call sys.exit / os._exit here, so users
+        # without ``restart: unless-stopped`` don't end up with a crashed
+        # container.
+        "dry_restart_seconds": float(
+            _env_int("MAMMOTION_DRY_RESTART_SECONDS", 180)
+        ),
+    }
 
     LOGGER.info("Loading Mammotion SDK modules")
     from pymammotion.client import MammotionClient
@@ -157,6 +208,56 @@ async def main() -> None:
             loop.add_signal_handler(sig, stop_async.set)
         except NotImplementedError:
             signal.signal(sig, lambda *_: stop_async.set())
+
+    # Outer retry loop: each iteration is one fully-isolated session. On
+    # graceful stop the inner function returns and we exit. On dryness
+    # watchdog trip the inner function raises _DryWatchdogTripped, all
+    # resources are torn down inside it, and we re-enter for a fresh start.
+    while not stop_async.is_set():
+        try:
+            await _run_bridge_session(stop_async, MammotionClient, config)
+            return
+        except _DryWatchdogTripped as exc:
+            LOGGER.warning(
+                "Dry watchdog tripped (%s) — restarting bridge in-process", exc
+            )
+            # Tiny pause so we don't tight-loop if something is permanently
+            # broken upstream. The relay's own backoff is the primary brake;
+            # this is just for the outer cycle.
+            try:
+                await asyncio.wait_for(stop_async.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def _run_bridge_session(
+    stop_async: asyncio.Event,
+    MammotionClient: Any,
+    config: dict[str, Any],
+) -> None:
+    """One full bootstrap → run → cleanup cycle.
+
+    Returns normally on graceful stop. Raises :class:`_DryWatchdogTripped`
+    if the relay reports no H265 RTP for ``config['dry_restart_seconds']``
+    consecutive seconds — the outer ``main`` loop catches it and re-enters.
+    All resources allocated here (relay, RTSP server, pymammotion client)
+    are released in the ``finally`` block before the exception propagates.
+    """
+    email = config["email"]
+    password = config["password"]
+    device_name = config["device_name"]
+    rtsp_port = config["rtsp_port"]
+    rtsp_bind = config["rtsp_bind"]
+    rtsp_host = config["rtsp_host"]
+    go2rtc_api_url = config["go2rtc_api_url"]
+    stream_name = config["stream_name"]
+    go2rtc_reconcile_interval = config["go2rtc_reconcile_interval"]
+    keepalive_interval = config["keepalive_interval"]
+    reconnect_backoff = config["reconnect_backoff"]
+    dry_restart_seconds = config["dry_restart_seconds"]
+
+    rtsp_source = f"rtsp://{rtsp_host}:{rtsp_port}/{stream_name}"
+    loop = asyncio.get_running_loop()
 
     # Shared state used by the credentials provider and keep-alive loop.
     state: dict[str, Any] = {
@@ -300,12 +401,8 @@ async def main() -> None:
         rtsp_server=rtsp_server,
         publisher_wakeup=wake_publisher,
         cheap_recovery=_refresh_fpv,
-        no_rtp_watchdog_seconds=float(
-            _env_int("MAMMOTION_NO_RTP_WATCHDOG_SECONDS", 5)
-        ),
-        cheap_recovery_wait_seconds=float(
-            _env_int("MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS", 3)
-        ),
+        no_rtp_watchdog_seconds=config["no_rtp_watchdog_seconds"],
+        cheap_recovery_wait_seconds=config["cheap_recovery_wait_seconds"],
     )
     # Wire the RTSP server's "new viewer connected" hook back to the relay
     # so we can opportunistically PLI Agora for a fresh keyframe — without
@@ -365,6 +462,16 @@ async def main() -> None:
         next_keepalive = loop.time()
         next_go2rtc_reconcile = loop.time()
         while not stop_async.is_set():
+            # Dryness check before anything else so a stuck session does not
+            # waste a keep-alive cycle on a doomed cloud client. ``finally``
+            # below handles teardown of everything we built in this session.
+            dryness = relay.seconds_since_last_rtp
+            if dryness > dry_restart_seconds:
+                raise _DryWatchdogTripped(
+                    f"no H265 RTP for {dryness:.0f}s "
+                    f"(threshold {dry_restart_seconds:.0f}s)"
+                )
+
             now = loop.time()
             mammotion = state["mammotion"]
             if mammotion is None:
