@@ -58,6 +58,7 @@ import signal
 import socket
 from typing import Any
 
+from mammotion_webrtc import __version__ as BRIDGE_VERSION
 from mammotion_webrtc.agora_session import (
     StreamCredentials,
     refresh_agora_context,
@@ -150,6 +151,7 @@ async def main() -> None:
         level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    LOGGER.info("Mammotion RTSP bridge v%s starting", BRIDGE_VERSION)
 
     email = os.getenv("MAMMOTION_EMAIL", "")
     password = os.getenv("MAMMOTION_PASSWORD", "")

@@ -16,6 +16,13 @@ transcoding, no ffmpeg.
 
 from __future__ import annotations
 
+# Single source of truth for the bridge version. Bump this together with
+# the git tag (e.g. tagging ``v0.1.11`` requires this string to read
+# ``"0.1.11"``). The bridge entrypoint logs it on startup so the running
+# container's version is obvious from the logs without inspecting the
+# image digest.
+__version__ = "0.1.10"
+
 __all__ = [
     "AgoraAPIClient",
     "AgoraResponse",
@@ -25,6 +32,7 @@ __all__ = [
     "Go2RtcRtspStream",
     "SDPParser",
     "StreamCredentials",
+    "__version__",
     "parse_offer_to_ortc",
 ]
 
