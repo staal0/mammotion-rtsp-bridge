@@ -106,6 +106,18 @@ class AgoraToRtspRelay:
         # Initialised to "now" so a bootstrap that never produces video also
         # ages out, instead of looking infinitely stale from t=0.
         self._last_rtp_ns: int = time.monotonic_ns()
+        # Throughput counters incremented in the RTP tap and sampled by the
+        # heartbeat. Lifetime totals (across all reconnect cycles) so the
+        # heartbeat can show "yes the process is still doing useful work"
+        # even after a recent stall.
+        self._packets_forwarded: int = 0
+        self._bytes_forwarded: int = 0
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._heartbeat_interval: float = 60.0
+        # Snapshot of (packets, bytes, monotonic_ns) at the previous
+        # heartbeat tick — used to derive interval-local pps and kbps so
+        # the heartbeat shows the *current* rate, not the lifetime average.
+        self._heartbeat_prev: tuple[int, int, int] = (0, 0, time.monotonic_ns())
 
     # ------------------------------------------------------------------
     # Public API
@@ -128,18 +140,78 @@ class AgoraToRtspRelay:
         if self._supervisor_task is not None and not self._supervisor_task.done():
             return
         self._stop_event.clear()
+        self._heartbeat_prev = (
+            self._packets_forwarded,
+            self._bytes_forwarded,
+            time.monotonic_ns(),
+        )
         self._supervisor_task = asyncio.create_task(self._supervise())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def stop(self) -> None:
         self._stop_event.set()
-        if self._supervisor_task is not None:
-            self._supervisor_task.cancel()
-            try:
-                await self._supervisor_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._supervisor_task = None
+        for task in (self._supervisor_task, self._heartbeat_task):
+            if task is not None:
+                task.cancel()
+        for task in (self._supervisor_task, self._heartbeat_task):
+            if task is not None:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._supervisor_task = None
+        self._heartbeat_task = None
         await self._teardown_upstream()
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodic INFO line summarising steady-state health.
+
+        Most failure modes show up as the absence of expected events; this
+        is the matching presence-of-success log. If you tail the log and
+        see one of these every minute, the bridge is working. If they go
+        silent, you've got an outage. Each line is small (< 200 chars) so
+        it doesn't drown the rest of the logs.
+        """
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=self._heartbeat_interval
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+
+                now_ns = time.monotonic_ns()
+                prev_pkts, prev_bytes, prev_ns = self._heartbeat_prev
+                elapsed = max(1e-6, (now_ns - prev_ns) / 1e9)
+                d_pkts = self._packets_forwarded - prev_pkts
+                d_bytes = self._bytes_forwarded - prev_bytes
+                pps = d_pkts / elapsed
+                kbps = (d_bytes * 8 / 1000) / elapsed
+                self._heartbeat_prev = (
+                    self._packets_forwarded,
+                    self._bytes_forwarded,
+                    now_ns,
+                )
+
+                pc = self._upstream_pc
+                upstream_state = pc.connectionState if pc is not None else "down"
+                idle_s = (now_ns - self._last_rtp_ns) / 1e9
+                rtsp_clients = self._rtsp_server.active_session_count
+
+                LOGGER.info(
+                    "Heartbeat upstream=%s last_rtp=%.1fs pps=%.0f kbps=%.0f "
+                    "lifetime_pkts=%d rtsp_clients=%d",
+                    upstream_state,
+                    idle_s,
+                    pps,
+                    kbps,
+                    self._packets_forwarded,
+                    rtsp_clients,
+                )
+        except asyncio.CancelledError:
+            return
 
     async def request_keyframe(self) -> None:
         """Send a PLI to Agora asking for an IDR.
@@ -429,6 +501,8 @@ class AgoraToRtspRelay:
                         relay_self._video_ssrc = effective.ssrc
                     if effective.payload:
                         relay_self._last_rtp_ns = time.monotonic_ns()
+                        relay_self._packets_forwarded += 1
+                        relay_self._bytes_forwarded += len(effective.payload)
                         rtsp_server.push_rtp(
                             payload=bytes(effective.payload),
                             timestamp=effective.timestamp,

@@ -6,6 +6,32 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-06-03
+
+### Added
+- Periodic heartbeat INFO line every 60 s from the relay summarising
+  steady-state health:
+  ```
+  Heartbeat upstream=connected last_rtp=0.4s pps=84 kbps=512
+  lifetime_pkts=15234 rtsp_clients=2
+  ```
+  If you tail the log and see one of these every minute, the bridge is
+  working. If they go silent, you've got an outage. Complements the
+  existing "I only log when something breaks" event style.
+- RTP throughput counters (`_packets_forwarded`, `_bytes_forwarded`) on
+  the relay, sampled by the heartbeat to derive interval-local pps/kbps.
+
+### Changed
+- `Publisher uid=X is now online` logged at INFO when the mower (a
+  non-self uid) appears via `on_user_online`. Our own uid joining stays
+  silent (already implied by the join-success log).
+- Demoted the per-message `WS-join <- type=… body=…` dump in the join
+  loop from INFO to DEBUG. It was 3-5 KB per message (dominated by
+  Agora's rtpCapabilities JSON) and only useful while debugging the
+  signaling itself. Typed events (`on_user_online`, `on_add_video_stream`,
+  `on_p2p_lost`, etc.) still log at INFO via their handlers, so normal
+  operation visibility is unchanged but the log volume drops sharply.
+
 ## [0.1.14] - 2026-06-03
 
 ### Added

@@ -763,11 +763,12 @@ class AgoraWebSocketHandler:
                         continue
 
                     message_type = response.get("_type", "")
-                    # TEMP diagnostic: log every message during the join phase so
-                    # we can find where Mammotion's edge delivers the ORTC params
-                    # (PetKit got them in the join-success _message; Mammotion's
-                    # join-success only carries {code,level,role}).
-                    LOGGER.info(
+                    # Full JSON body is verbose (~3-5 KB per message during
+                    # negotiation, dominated by Agora's rtpCapabilities dump).
+                    # Useful only when debugging join-time issues, so it lives
+                    # at DEBUG. The handler-dispatch path below logs typed
+                    # events at INFO at a much saner volume.
+                    LOGGER.debug(
                         "WS-join <- type=%s result=%s body=%s",
                         message_type,
                         response.get("_result"),
@@ -978,11 +979,23 @@ class AgoraWebSocketHandler:
         LOGGER.debug("Agora rtp capability change: %s", response.get("_message", {}))
 
     async def _handle_user_online(self, response: dict[str, Any]) -> None:
-        """Track online users."""
+        """Track online users.
+
+        Logs at INFO when the publisher (a non-self uid) appears — that's
+        the event that means "the mower is now in the channel and about to
+        start publishing". Our own uid joining is silent (already implied
+        by the join-success log).
+        """
         message = response.get("_message", {})
         uid = message.get("uid")
-        if isinstance(uid, int):
-            self._online_users.add(uid)
+        if not isinstance(uid, int):
+            return
+        self._online_users.add(uid)
+        if self._uid is not None and uid != self._uid:
+            LOGGER.info(
+                "Publisher uid=%s is now online in the channel; awaiting on_add_video_stream",
+                uid,
+            )
 
     async def _handle_user_offline(self, response: dict[str, Any]) -> None:
         """Handle the Agora ``on_user_offline`` event.
