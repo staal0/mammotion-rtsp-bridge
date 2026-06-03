@@ -73,11 +73,12 @@ docker compose up -d mammotion-bridge
 | `MAMMOTION_RTSP_PORT` | `8554` | RTSP listen port inside the container |
 | `MAMMOTION_RTSP_BIND` | `0.0.0.0` | RTSP bind address |
 | `MAMMOTION_GO2RTC_RECONCILE_SECONDS` | `20` | Periodic go2rtc registration self-heal interval |
-| `MAMMOTION_KEEPALIVE_SECONDS` | `300` | MQTT keepalive cadence to the mower (stay under pymammotion's 300/24h cap) |
-| `MAMMOTION_NO_RTP_WATCHDOG_SECONDS` | `5` | Tear down + reconnect the Agora session if no H265 RTP arrives for this long |
-| `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS` | `3` | On stall, wait this long after a `refresh_fpv` MQTT nudge before escalating to a full teardown |
+| `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keepalive to the mower. Stays well under the publisher-idle timeout (~50 s) so the mower keeps publishing between recoveries |
+| `MAMMOTION_NO_RTP_WATCHDOG_SECONDS` | `5` | If no H265 RTP arrives for this long, trigger an in-relay cheap recovery (`refresh_stream_subscription`); escalate to a full teardown if that doesn't restore packets |
+| `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS` | `5` | How long to wait after a cheap-recovery call before judging it failed |
+| `MAMMOTION_DRY_RESTART_SECONDS` | `180` | If no H265 RTP at all for this many seconds, tear the whole bridge down in-process (relay + RTSP + pymammotion client) and re-bootstrap from a fresh cloud login. Escape from "stale cloud session, in-relay recovery isn't working" failure modes. No process exit — works regardless of Docker restart policy |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Retry delay on cloud/session failure |
-| `MAMMOTION_LOG_LEVEL` | `INFO` | `DEBUG` exposes RTSP method exchange and signaling traces |
+| `MAMMOTION_LOG_LEVEL` | `INFO` | `DEBUG` exposes the per-message join-loop body dumps and RTSP method exchange |
 
 ## Viewer compatibility
 
@@ -86,28 +87,41 @@ The bridge serves a plain RTP-over-RTSP H265 stream. Consumers tested:
 - **Frigate / go2rtc (RTSP source)** — works (this is the primary target).
 - **ffplay / VLC** — works (`rtsp://<host>:8554/<stream>`).
 - **go2rtc `stream.html?mode=webrtc`** — works smoothly when the browser
-  supports H265 over WebRTC (Safari/Chrome on Apple Silicon do).
+  supports H265 over WebRTC (Safari / recent Chrome do; Firefox does not).
 - **go2rtc `stream.html` (MSE default)** — choppy. Mammotion encodes at
   ~10 fps and Chrome's MSE low-delay renderer stalls on low-framerate H265.
   Use `&mode=webrtc` or play the RTSP URL directly.
 
 ## Reliability
 
-- The Agora subscription is self-healing with bounded backoff. If the upstream
-  WebRTC connection fails, the bridge tears it down and reconnects, refetching
-  cloud credentials so expired tokens are handled implicitly.
-- A no-RTP watchdog (default 30 s) detects the case where the ICE/DTLS session
-  stays nominally healthy but the mower's publisher has gone silent. When that
-  happens the bridge tears down the upstream and lets the supervisor reconnect
-  — which fetches fresh credentials and re-triggers the mower to publish.
-- MQTT keepalive cadence is conservative (default 5 min) because pymammotion's
-  Aliyun MQTT transport caps the bridge at ~300 sends/24 h. The publisher is
-  kept alive primarily by remaining subscribed as an Agora audience client,
-  not by aggressive MQTT pings.
-- go2rtc registration is reconciled periodically, so the stream comes back on
-  its own after a Frigate restart.
-- A fresh Mammotion login is performed per cycle so a stale cloud token can't
-  wedge the bridge for hours.
+Three layers of recovery, each handling a different failure class:
+
+1. **In-relay cheap recovery.** If no H265 RTP arrives for
+   `MAMMOTION_NO_RTP_WATCHDOG_SECONDS` (default 5 s), the relay fires
+   `pymammotion.refresh_stream_subscription` — that re-fetches a token AND
+   tells the mower to rejoin Agora, all over the existing MQTT session
+   without tearing down the upstream PC. Recovers from "publisher idle-timed
+   out" in 1-2 s.
+2. **Full upstream teardown.** If cheap recovery didn't restore packets
+   within `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS` (default 5 s), the relay
+   tears down the upstream PC and reconnects from scratch with fresh
+   credentials. Recovers from genuine ICE/DTLS or token-expiry failures.
+3. **In-process bridge restart.** If those still haven't brought RTP back
+   after `MAMMOTION_DRY_RESTART_SECONDS` (default 180 s), the bridge tears
+   down everything *including* the pymammotion client and re-bootstraps from
+   a fresh cloud login inside the same process. Escapes "stale session"
+   failure modes the in-relay loop can't recover from. No `sys.exit`, so it
+   works without any Docker restart policy.
+
+Other reliability bits:
+
+- A **heartbeat INFO line** every 60 s summarises steady-state health
+  (upstream state, last-RTP age, pps, kbps, lifetime packet count, RTSP
+  client count). If you tail the log and these go silent, something's wrong.
+- **go2rtc registration is reconciled periodically**, so the stream comes
+  back on its own after a Frigate restart.
+- **Cloud-login refresh per cycle** so a stale pymammotion refresh token
+  can't wedge the bridge for hours.
 
 ## Limitations
 
@@ -121,12 +135,20 @@ The bridge serves a plain RTP-over-RTSP H265 stream. Consumers tested:
 - **Local-only is not possible.** All Mammotion video is brokered through
   Agora's cloud; there is no documented LAN-direct path today.
 
-## Integration idea for Mammotion-HA
+## Integration with Mammotion-HA
 
-The Agora-edge subscriber and H265 RTP tap could be folded into Mammotion-HA
-as an opt-in "expose camera as RTSP" feature, so users get a Frigate-ready
-camera without a side container. Happy to help wire it up — see the issue
-thread for context.
+mikey0000 is extracting the Agora WebRTC client used here into a standalone
+library, [PyAgora](https://github.com/mikey0000/PyAgora). Once that's
+published and HA-agnostic (it currently has a hard `homeassistant.core`
+import), the ~2 kLOC of duplicated Agora code in
+[mammotion_webrtc/agora_edge.py](mammotion_webrtc/agora_edge.py) and
+[mammotion_webrtc/sdp.py](mammotion_webrtc/sdp.py) goes away in favour of
+`pip install pyagora`.
+
+The longer-term direction discussed upstream is to push the H265-passthrough
++ RTSP server *into* mikey's Mammotion HA integration so users get a
+Frigate-ready RTSP camera without running this separate container at all.
+That's a larger rework — for now this bridge stays the dedicated path.
 
 ## Releases
 
@@ -144,4 +166,6 @@ See [CHANGELOG.md](CHANGELOG.md).
 Built on [pymammotion](https://github.com/mikey0000/PyMammotion) for cloud
 auth and Agora token fetch. The H265 patch + relay design borrows ideas from
 the PetKit HA integration's Agora WebRTC client (MIT,
-© 2024-2026 @Jezza34000).
+© 2024-2026 @Jezza34000) and from mikey0000's
+[PyAgora](https://github.com/mikey0000/PyAgora) (`on_user_offline`,
+`on_p2p_ok`, `renew_token` handlers).

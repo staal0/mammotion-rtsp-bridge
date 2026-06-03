@@ -6,6 +6,34 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-06-03
+
+### Removed
+- Dead code in `agora_edge.py` left over from the WHEP era:
+  - Duplicate `_send_renew_token` (the older variant calling
+    `rtc_token_provider`; superseded by the v0.1.14 port from PyAgora).
+  - `add_ice_candidate`, `self.candidates`, `_convert_candidates_to_ortc`
+    — the candidate-trickle path required by browser-driven WHEP
+    signaling. aiortc gathers its own candidates upstream now.
+  - `_fire_connection_lost` and its `on_connection_lost` constructor
+    callback — never wired by any caller in this codebase.
+  - `pion_compat` / `disable_audio_answer` / `rtc_token_provider`
+    constructor parameters — defaulted to off and never overridden;
+    code paths consuming them were unreachable.
+  - `_upstream_ready` event on the relay — set/cleared but never
+    awaited by anything.
+- About 100 lines net out of `agora_edge.py`.
+
+### Changed
+- `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS` constructor default on the
+  relay aligned to 5 s (was 3 s) — matches the bridge's env default
+  shipped in v0.1.13.
+- README rewritten to reflect the current architecture: drops stale
+  references to `refresh_fpv`, the 300 s keepalive default, the
+  pre-watchdog reliability story, and the WHEP path. Adds
+  `MAMMOTION_DRY_RESTART_SECONDS` and the new three-layer recovery
+  description.
+
 ## [0.1.15] - 2026-06-03
 
 ### Added

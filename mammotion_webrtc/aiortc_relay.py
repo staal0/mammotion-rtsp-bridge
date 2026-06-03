@@ -71,7 +71,7 @@ class AgoraToRtspRelay:
         reconnect_backoff_seconds: float = 1.0,
         max_reconnect_backoff_seconds: float = 60.0,
         no_rtp_watchdog_seconds: float = 5.0,
-        cheap_recovery_wait_seconds: float = 3.0,
+        cheap_recovery_wait_seconds: float = 5.0,
     ) -> None:
         self._credentials_provider = credentials_provider
         self._agora_context_provider = agora_context_provider
@@ -97,8 +97,6 @@ class AgoraToRtspRelay:
         # SSRC of the inbound H265 stream — needed for the PLI we send on
         # behalf of new RTSP clients. None until the first packet arrives.
         self._video_ssrc: int | None = None
-        # Set when the upstream PC reaches "connected"; cleared on teardown.
-        self._upstream_ready = asyncio.Event()
         # Monotonic-ns timestamp of the last forwarded H265 RTP packet. Used
         # by the in-relay no-RTP watchdog (tears down + reconnects) AND by
         # the bridge-level dryness watchdog (restarts the whole process when
@@ -327,10 +325,7 @@ class AgoraToRtspRelay:
         def _on_state() -> None:
             state = pc.connectionState
             LOGGER.info("Upstream aiortc connectionState=%s", state)
-            if state == "connected":
-                self._upstream_ready.set()
-            elif state in ("failed", "closed", "disconnected"):
-                self._upstream_ready.clear()
+            if state in ("failed", "closed", "disconnected"):
                 connection_failed.set()
 
         offer = await pc.createOffer()
@@ -538,7 +533,6 @@ class AgoraToRtspRelay:
         self._upstream_pc = None
         self._video_receiver = None
         self._video_ssrc = None
-        self._upstream_ready.clear()
 
         if handler is not None:
             try:

@@ -32,7 +32,7 @@ import logging
 import secrets
 import ssl
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Self
 
@@ -575,15 +575,11 @@ class AgoraWebSocketHandler:
 
     def __init__(
         self,
-        rtc_token_provider: Callable[[], Awaitable[str | None]] | None = None,
         *,
         prefer_instant_video: bool = False,
         subscribe_retry_delay: float = 0.0,
         subscribe_retry_attempts: int = 0,
         declare_remote_video_ssrc: bool = False,
-        disable_audio_answer: bool = False,
-        pion_compat: bool = False,
-        on_connection_lost: Callable[[], None] | None = None,
         video_codec: str = DEFAULT_VIDEO_CODEC,
     ) -> None:
         """Initialize runtime state."""
@@ -591,9 +587,7 @@ class AgoraWebSocketHandler:
         self._connection_state = "DISCONNECTED"
         self._message_handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
         self._disconnect_task: asyncio.Task[None] | None = None
-        self._on_connection_lost = on_connection_lost
 
-        self.candidates: list[RTCIceCandidateInit] = []
         self._online_users: set[int] = set()
         self._video_streams: dict[int, dict[str, Any]] = {}
         self._subscribed_video_streams: set[tuple[int, int]] = set()
@@ -607,7 +601,6 @@ class AgoraWebSocketHandler:
         self._pending_answer_ortc: dict[str, Any] | None = None
         self._pending_offer_info: OfferSdpInfo | None = None
         self._rtc_token: str | None = None
-        self._rtc_token_provider = rtc_token_provider
         # Our own uid on this Agora channel. Stored from ``connect_and_join``
         # so :meth:`_handle_user_offline` can distinguish "the other peer
         # (publisher) left" from "we left" — the response semantics differ.
@@ -616,10 +609,9 @@ class AgoraWebSocketHandler:
         self._subscribe_retry_delay = subscribe_retry_delay
         self._subscribe_retry_attempts = subscribe_retry_attempts
         self._declare_remote_video_ssrc = declare_remote_video_ssrc
-        self._disable_audio_answer = disable_audio_answer
-        self._pion_compat = pion_compat
-        # Mammotion publishes H.265 (see DEFAULT_VIDEO_CODEC). PetKit hardcoded
-        # "h264" inline; here it is configurable but defaults to h265.
+        # Mammotion publishes H.265. Kept as a constructor knob so a future
+        # consumer with a different publisher (H.264) can override without
+        # editing the SDP generation paths that reference this.
         self._video_codec = video_codec
 
         self._setup_message_handlers()
@@ -636,10 +628,6 @@ class AgoraWebSocketHandler:
             "on_user_offline": self._handle_user_offline,
             "on_add_video_stream": self._handle_add_video_stream,
         }
-
-    def add_ice_candidate(self, candidate: RTCIceCandidateInit) -> None:
-        """Collect browser ICE candidates before join_v3."""
-        self.candidates.append(candidate)
 
     async def connect_and_join(
         self,
@@ -663,17 +651,10 @@ class AgoraWebSocketHandler:
             LOGGER.error("Failed to build ORTC capabilities from offer")
             return None
 
-        # Add gathered candidates to ORTC offer before join_v3.
-        gathered_candidates = self._convert_candidates_to_ortc()
-        if gathered_candidates:
-            ortc_info.setdefault("iceParameters", {})[
-                "candidates"
-            ] = gathered_candidates
-        LOGGER.debug(
-            "Agora join_v3: session=%s gathered_candidates=%d",
-            session_id,
-            len(gathered_candidates),
-        )
+        # aiortc handles its own ICE gathering on the upstream PC, so we
+        # don't trickle browser-side candidates here. The WHEP era used to
+        # need it; we don't.
+        LOGGER.debug("Agora join_v3: session=%s", session_id)
 
         gateway_addresses = agora_response.get_gateway_addresses()
         if not gateway_addresses:
@@ -833,7 +814,6 @@ class AgoraWebSocketHandler:
             raise
         except WebSocketException as err:
             LOGGER.warning("Agora message loop closed: %s", err)
-            self._fire_connection_lost()
         finally:
             self._connection_state = "DISCONNECTED"
 
@@ -854,31 +834,6 @@ class AgoraWebSocketHandler:
             raise
         except (WebSocketException, OSError) as err:
             LOGGER.debug("Agora ping loop ended: %s", err)
-
-    async def _send_renew_token(self) -> None:
-        """Send renew_token with current rtc token."""
-        if self._rtc_token_provider:
-            try:
-                refreshed_token = await self._rtc_token_provider()
-            except Exception as err:  # noqa: BLE001
-                LOGGER.debug("Failed to refresh RTC token for renew_token: %s", err)
-                return
-            if not refreshed_token:
-                LOGGER.debug(
-                    "RTC token refresh returned empty value; skipping renew_token"
-                )
-                return
-            self._rtc_token = refreshed_token
-
-        if not self._websocket or not self._rtc_token:
-            return
-
-        renew_message = {
-            "_id": secrets.token_hex(3),
-            "_type": "renew_token",
-            "_message": {"token": self._rtc_token},
-        }
-        await self._websocket.send(json.dumps(renew_message))
 
     async def _handle_join_success(
         self,
@@ -967,7 +922,6 @@ class AgoraWebSocketHandler:
             response.get("error_str"),
         )
         self._disconnect_task = asyncio.create_task(self.disconnect())
-        self._fire_connection_lost()
 
     async def _handle_error(self, response: dict[str, Any]) -> None:
         """Handle generic Agora signaling errors."""
@@ -1355,37 +1309,6 @@ class AgoraWebSocketHandler:
             },
         }
 
-    def _convert_candidates_to_ortc(self) -> list[dict[str, Any]]:
-        """Convert browser ICE candidates to Agora ORTC format."""
-        converted: list[dict[str, Any]] = []
-
-        for candidate in self.candidates:
-            candidate_string = candidate.candidate
-            if not candidate_string:
-                continue
-
-            candidate_string = candidate_string.removeprefix("candidate:")
-
-            parts = candidate_string.split()
-            if len(parts) < 8:
-                continue
-
-            try:
-                converted.append(
-                    {
-                        "foundation": parts[0],
-                        "ip": parts[4],
-                        "port": int(parts[5]),
-                        "priority": int(parts[3]),
-                        "protocol": parts[2],
-                        "type": parts[7],
-                    }
-                )
-            except (TypeError, ValueError):
-                continue
-
-        return converted
-
     @staticmethod
     def _parse_offer_sdp(offer_sdp: str) -> OfferSdpInfo | None:
         """Parse browser SDP offer using the local SDPParser.
@@ -1563,12 +1486,7 @@ class AgoraWebSocketHandler:
                 # have no IPv6 route, and an unreachable candidate in front of
                 # the working IPv4 one delays ICE for the worse.
                 continue
-            if self._pion_compat:
-                # Pion is stricter than browser libwebrtc with non-numeric
-                # foundations seen in Agora ORTC payloads.
-                foundation = str(index + 1)
-            else:
-                foundation = candidate.get("foundation") or f"candidate{index}"
+            foundation = candidate.get("foundation") or f"candidate{index}"
             protocol = candidate.get("protocol", "udp")
             priority = candidate.get("priority", 2103266323)
             port = candidate.get("port", 0)
@@ -1664,7 +1582,7 @@ class AgoraWebSocketHandler:
             "a=rtcp:9 IN IP4 0.0.0.0",
             f"a=ice-ufrag:{ice_ufrag}",
             f"a=ice-pwd:{ice_pwd}",
-            *([] if self._pion_compat else ["a=ice-options:trickle"]),
+            "a=ice-options:trickle",
             f"a=fingerprint:{fingerprint}",
             "a=setup:active",
             f"a=mid:{mid}",
@@ -1775,8 +1693,6 @@ class AgoraWebSocketHandler:
         """Build the SDP lines for one audio or video media section."""
         media_type = media.get("type", "audio")
         answer_direction = self._answer_direction(media.get("direction", "sendonly"))
-        if media_type == "audio" and self._disable_audio_answer:
-            answer_direction = "inactive"
 
         codecs = (
             caps.get("audioCodecs", []) or []
@@ -1913,12 +1829,6 @@ class AgoraWebSocketHandler:
     def is_connected(self) -> bool:
         """Return websocket connectivity state."""
         return self._connection_state == "CONNECTED"
-
-    def _fire_connection_lost(self) -> None:
-        """Notify the owner that the Agora connection dropped unexpectedly."""
-        if self._on_connection_lost is not None:
-            self._on_connection_lost()
-            self._on_connection_lost = None
 
     async def disconnect(self) -> None:
         """Close websocket and cancel background tasks."""
