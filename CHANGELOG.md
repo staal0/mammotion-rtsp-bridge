@@ -6,6 +6,27 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-06-03
+
+### Added
+- Three Agora event handlers / helpers backported from mikey0000's
+  [PyAgora](https://github.com/mikey0000/PyAgora) (the upstream
+  extraction of the integration's Agora WebSocket client we'll switch
+  to as a dep once it's HA-agnostic and published):
+  - `_handle_user_offline` — fires when the publisher (mower) leaves
+    the channel. Clears stale `_online_users` / `_video_streams`
+    entries and sends `renew_token` so the Agora session stays warm,
+    so a rejoin can subscribe immediately without renegotiating the WS.
+  - `_handle_p2p_ok` — logs the SFU peer-confirmation event for
+    visibility when debugging slow joins.
+  - `_send_renew_token` — sends Agora's `renew_token` over the
+    existing WebSocket. Now invoked by `_handle_user_offline`; can
+    also be used to extend a long-running session before the cached
+    token's 24 h lifetime expires.
+- `AgoraWebSocketHandler` now tracks `self._uid` (our own uid on the
+  channel) so the offline handler can distinguish "publisher left" from
+  "we left".
+
 ## [0.1.13] - 2026-06-03
 
 ### Fixed

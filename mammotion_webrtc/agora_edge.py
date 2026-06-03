@@ -608,6 +608,10 @@ class AgoraWebSocketHandler:
         self._pending_offer_info: OfferSdpInfo | None = None
         self._rtc_token: str | None = None
         self._rtc_token_provider = rtc_token_provider
+        # Our own uid on this Agora channel. Stored from ``connect_and_join``
+        # so :meth:`_handle_user_offline` can distinguish "the other peer
+        # (publisher) left" from "we left" — the response semantics differ.
+        self._uid: int | None = None
         self._prefer_instant_video = prefer_instant_video
         self._subscribe_retry_delay = subscribe_retry_delay
         self._subscribe_retry_attempts = subscribe_retry_attempts
@@ -624,10 +628,12 @@ class AgoraWebSocketHandler:
         """Register incoming message handlers."""
         self._message_handlers = {
             "answer": self._handle_answer,
+            "on_p2p_ok": self._handle_p2p_ok,
             "on_p2p_lost": self._handle_p2p_lost,
             "error": self._handle_error,
             "on_rtp_capability_change": self._handle_rtp_capability_change,
             "on_user_online": self._handle_user_online,
+            "on_user_offline": self._handle_user_offline,
             "on_add_video_stream": self._handle_add_video_stream,
         }
 
@@ -645,6 +651,7 @@ class AgoraWebSocketHandler:
     ) -> str | None:
         """Connect to Agora edge WebSocket and return answer SDP."""
         self._rtc_token = live_feed.rtc_token
+        self._uid = int(live_feed.uid)
 
         offer_info = self._parse_offer_sdp(offer_sdp)
         if offer_info is None:
@@ -976,6 +983,76 @@ class AgoraWebSocketHandler:
         uid = message.get("uid")
         if isinstance(uid, int):
             self._online_users.add(uid)
+
+    async def _handle_user_offline(self, response: dict[str, Any]) -> None:
+        """Handle the Agora ``on_user_offline`` event.
+
+        Ported from mikey0000's PyAgora (which adapted it from the Agora APK).
+        When the publisher (a remote uid, not ours) leaves the channel:
+
+        * drop it from ``_online_users`` and ``_video_streams`` so a future
+          ``on_user_online`` triggers a fresh ``_handle_add_video_stream``
+          flow instead of reusing stale state;
+        * send a ``renew_token`` over the existing WebSocket so Agora keeps
+          our session warm — when the publisher rejoins we can immediately
+          subscribe again without renegotiating the WS.
+
+        If our own uid is what went offline we just log it; the caller is
+        already in the process of disconnecting.
+        """
+        message = response.get("_message", {})
+        uid = message.get("uid")
+        reason = message.get("reason", "unknown")
+        if not isinstance(uid, int):
+            return
+        LOGGER.info("Agora user %s went offline (reason: %s)", uid, reason)
+        self._online_users.discard(uid)
+        self._video_streams.pop(uid, None)
+        if uid != self._uid and self._websocket is not None:
+            LOGGER.info(
+                "Publisher %s left while our uid %s is still connected; "
+                "refreshing Agora token to keep the session warm",
+                uid,
+                self._uid,
+            )
+            await self._send_renew_token()
+
+    async def _handle_p2p_ok(self, response: dict[str, Any]) -> None:
+        """Handle ``on_p2p_ok`` — Agora SFU confirmed the peer connection.
+
+        Ported from PyAgora. Purely informational; useful for tracing the
+        signaling timeline when debugging slow joins. The uid in the message
+        is *our* uid (the join was accepted by the SFU), not the publisher's.
+        """
+        message = response.get("_message", {})
+        uid = message.get("uid")
+        proxy = message.get("proxy", False)
+        LOGGER.info("Agora on_p2p_ok: proxy=%s uid=%s", proxy, uid)
+        if isinstance(uid, int) and self._uid is not None and uid != self._uid:
+            LOGGER.warning(
+                "on_p2p_ok uid mismatch: expected %s, got %s", self._uid, uid
+            )
+
+    async def _send_renew_token(self) -> None:
+        """Send Agora's ``renew_token`` over the existing WebSocket.
+
+        Ported from PyAgora. Extends the current Agora session without a
+        full reconnect. The token we send is our cached ``_rtc_token`` —
+        if it has expired (24h lifetime) Agora will reject and our regular
+        reconnect path picks it up.
+        """
+        if self._websocket is None or self._rtc_token is None:
+            return
+        try:
+            renew_msg = {
+                "_id": secrets.token_hex(3),
+                "_type": "renew_token",
+                "_message": {"token": self._rtc_token},
+            }
+            await self._websocket.send(json.dumps(renew_msg))
+            LOGGER.info("Sent Agora renew_token")
+        except (WebSocketException, ConnectionError) as ex:
+            LOGGER.warning("Failed to send renew_token: %s", ex)
 
     async def _handle_add_video_stream(self, response: dict[str, Any]) -> str | None:
         """Auto-subscribe to newly announced video stream."""
