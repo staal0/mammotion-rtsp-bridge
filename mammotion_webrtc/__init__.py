@@ -21,7 +21,7 @@ from __future__ import annotations
 # ``"0.1.11"``). The bridge entrypoint logs it on startup so the running
 # container's version is obvious from the logs without inspecting the
 # image digest.
-__version__ = "0.1.17"
+__version__ = "0.1.18"
 
 __all__ = [
     "AgoraAPIClient",

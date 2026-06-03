@@ -418,6 +418,75 @@ async def _run_bridge_session(
                 state["creds_fetched_at"] = loop.time()
         return True
 
+    async def _send_keepalive_heartbeat() -> bool:
+        """Send a ``ble_sync sync_type=2`` ping that doesn't burn the cloud budget.
+
+        pymammotion's MQTT transports cap user-initiated sends at 300 per
+        24 h ("self-imposing rate limit" warning). Calling
+        ``send_command_with_args`` would count against that budget — at our
+        10 s keepalive cadence we'd exhaust it in ~25 minutes and then the
+        publisher idle-times out (no signal reaches it) for hours until the
+        rolling window slides forward.
+
+        pymammotion has a dedicated heartbeat path on each transport
+        (``Transport.send_heartbeat``) which intentionally skips
+        ``record_send()`` — its docstring explicitly says "periodic
+        ble_sync pings don't burn the 300-sends/24 h budget". We go through
+        that path here. Same MQTT message hits the mower, no budget cost.
+
+        Falls back to ``send_command_with_args`` if anything in the
+        pymammotion API surface has shifted in a future release.
+        """
+        mammotion = state["mammotion"]
+        device = state.get("device_name")
+        if mammotion is None or not device:
+            return False
+        try:
+            # Lazy import so a pymammotion version without these symbols
+            # only fails at the first heartbeat tick, not at bridge startup.
+            from pymammotion.proto import TransportType
+        except Exception:  # noqa: BLE001
+            return await _fallback_keepalive_via_command(mammotion, device)
+        try:
+            handle = mammotion.device_registry.get_by_name(device)
+            if handle is None:
+                return False
+            cmd_bytes = handle.commands.send_todev_ble_sync(sync_type=2)
+            # Prefer Aliyun MQTT (the rate-limited transport we're worried
+            # about); fall back to the other cloud transport if Aliyun isn't
+            # currently connected. Either accepts ble_sync just fine.
+            for tt in (TransportType.CLOUD_ALIYUN, TransportType.CLOUD_MAMMOTION):
+                transport = handle.get_transport(tt)
+                if transport is not None and transport.is_connected:
+                    await transport.send_heartbeat(cmd_bytes, iot_id=handle.iot_id)
+                    return True
+            return False
+        except AttributeError:
+            # pymammotion internals shifted — fall back to the command-args path.
+            LOGGER.debug(
+                "heartbeat path unavailable in this pymammotion; using send_command_with_args",
+                exc_info=True,
+            )
+            return await _fallback_keepalive_via_command(mammotion, device)
+        except Exception:
+            LOGGER.debug("Heartbeat keepalive failed", exc_info=True)
+            return False
+
+    async def _fallback_keepalive_via_command(mammotion: Any, device: str) -> bool:
+        """Legacy keepalive path — counts against the 300/24 h budget.
+
+        Only invoked if the heartbeat path isn't available in the installed
+        pymammotion version. Same wire effect, just rate-limited.
+        """
+        try:
+            await mammotion.send_command_with_args(
+                device, "send_todev_ble_sync", sync_type=2
+            )
+            return True
+        except Exception:
+            LOGGER.debug("Fallback keepalive failed", exc_info=True)
+            return False
+
     async def wake_publisher() -> None:
         """Force the mower into the Agora channel with video on.
 
@@ -573,28 +642,25 @@ async def _run_bridge_session(
                 next_go2rtc_reconcile = now + go2rtc_reconcile_interval
 
             if now >= next_keepalive:
-                # Periodic keep-alive. ``send_todev_ble_sync sync_type=2`` is
-                # the universal "I'm still here" ping — works on WiFi and 4G,
-                # cheap, and keeps the cloud MQTT session warm so the relay
-                # supervisor can reconnect quickly if the publisher stalls.
-                # ``refresh_fpv`` is fired as a best-effort secondary because
-                # on 4G it nudges the encoder, but it's a no-op on WiFi so we
-                # do not rely on it for the actual keep-alive.
-                try:
-                    await mammotion.send_command_with_args(
-                        state["device_name"], "send_todev_ble_sync", sync_type=2
+                # Periodic keep-alive via pymammotion's *heartbeat* path
+                # (transport.send_heartbeat). Same ble_sync sync_type=2
+                # message as before but bypasses pymammotion's 300/24h
+                # MQTT budget — without that bypass, our 10s cadence ate
+                # the whole budget in ~25 minutes, after which the mower
+                # silently stopped getting keepalives and idle-timed out.
+                # No refresh_fpv on this path: it counts against the
+                # budget AND is a no-op on WiFi (per upstream), so it
+                # bought us nothing while costing 50% of our 24h budget.
+                sent = await _send_keepalive_heartbeat()
+                if not sent:
+                    LOGGER.debug(
+                        "Keepalive heartbeat failed; dropping client to re-login"
                     )
-                except Exception:
-                    LOGGER.debug("Keep-alive sync failed", exc_info=True)
-                    # A failing keep-alive usually means a dead cloud
-                    # session. Drop the client; the loop re-logs in.
                     try:
                         await mammotion.stop()
                     except Exception:
                         pass
                     state["mammotion"] = None
-                else:
-                    await _refresh_fpv()
                 next_keepalive = now + keepalive_interval
 
             try:

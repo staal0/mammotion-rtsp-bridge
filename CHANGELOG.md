@@ -6,6 +6,38 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-06-03
+
+### Fixed
+- **Bridge can now run 24/7.** Previous keepalive used
+  `client.send_command_with_args(..., "send_todev_ble_sync", sync_type=2)`
+  which counts against pymammotion's self-imposed "300 sends per 24 h"
+  MQTT budget. At our 10 s cadence that burned through the budget in
+  ~25 minutes; pymammotion then silently rate-limited all our outgoing
+  MQTT, the mower stopped receiving keepalives, idle-timed out at ~50 s,
+  and every recovery cycle hit the same wall (logs showed
+  `Publisher 1 went offline (reason: Quit)` repeating for hours).
+
+  Switched the steady-state keepalive to pymammotion's dedicated
+  heartbeat path
+  (`handle.get_transport(TransportType.CLOUD_ALIYUN).send_heartbeat(...)`).
+  Same MQTT message reaches the mower; pymammotion explicitly skips
+  `record_send()` for the heartbeat path so it does NOT count against the
+  300/24 h budget. Quote from
+  `pymammotion/transport/base.py`: *"MQTT transports override this to
+  skip record_send() so periodic ble_sync pings don't burn the
+  300-sends/24 h budget."*
+
+- Also dropped `refresh_fpv` from the steady-state keepalive loop. It
+  was firing every cycle paired with the ble_sync, doubling our MQTT
+  send rate, AND mikey0000 confirmed it's a no-op for mowers on WiFi.
+  Removed from the periodic loop; still present in `wake_publisher` and
+  the relay's cheap-recovery path where it's at least theoretically
+  useful on 4 G installs (and rare enough not to hurt the budget).
+
+- Falls back gracefully to `send_command_with_args` if a future
+  pymammotion release reorganises the transport/heartbeat API.
+
 ## [0.1.17] - 2026-06-03
 
 ### Added
