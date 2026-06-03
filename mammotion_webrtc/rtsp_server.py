@@ -64,6 +64,82 @@ _PARAMETER_SET_WAIT_SECONDS = 10.0
 # is generous (≈4s at 8 Mbps H265) and protects against a Frigate-side stall.
 _SESSION_QUEUE_HIGH_WATER = 1024
 
+# H265 RTP clock rate (Hz). Same as H264 — the dynamic-PT video clock that
+# the SDP `a=rtpmap:96 H265/90000` line advertises.
+_RTP_CLOCK_HZ = 90000
+
+# Pacing target: hold ~200 ms of headroom in the consumer's jitter buffer
+# before starting playback. The receiver gets packets at their natural rate
+# (derived from the RTP timestamps) instead of in the bursts Agora actually
+# delivers to us, which is what made Chrome's MSE / WebRTC jitter buffer
+# thrash. 200 ms is the sweet spot: enough to smooth ordinary network
+# jitter without making the live view feel laggy.
+_PACER_INITIAL_DELAY_NS = 200_000_000
+
+# Re-anchor the pacer if the RTP timestamp jumps by more than this much
+# (relative to the anchor). Covers two cases: upstream restart with a
+# different timestamp base, and 32-bit timestamp wraparound (~13 hours at
+# 90 kHz — well outside this threshold but the modular arithmetic handles
+# it naturally via the signed-delta conversion).
+_PACER_REANCHOR_THRESHOLD_TS = 30 * _RTP_CLOCK_HZ  # 30 s
+
+# Cap a single pacer sleep at this much. Defensive — if we ever compute an
+# impossibly large target (corrupt timestamp, etc.), don't stall the writer
+# for minutes.
+_PACER_MAX_SLEEP_NS = 1_000_000_000  # 1 s
+
+# Emit one RTCP Sender Report per session every this many ns. SR carries the
+# NTP-to-RTP-timestamp anchor that lets the receiver pace playback against a
+# real-world clock instead of guessing from arrival times. Without SR,
+# Chrome/MSE renders bursty; 5 s is what most production RTSP servers use.
+_RTCP_SR_INTERVAL_NS = 5_000_000_000
+
+# NTP epoch offset: seconds between 1900-01-01 and 1970-01-01.
+_NTP_EPOCH_OFFSET = 2_208_988_800
+
+
+def _ntp_timestamp_now() -> tuple[int, int]:
+    """Return the current wall-clock time as a 64-bit NTP timestamp.
+
+    Returns ``(seconds_since_1900, fractional_part_as_32bit)``. The pair is
+    what RFC 3550 §6.4.1 wants in the NTP timestamp field of an SR packet.
+    """
+    t = time.time()
+    seconds = int(t) + _NTP_EPOCH_OFFSET
+    frac = int((t - int(t)) * (1 << 32))
+    return seconds & 0xFFFFFFFF, frac & 0xFFFFFFFF
+
+
+def _build_sr_packet(
+    *,
+    ssrc: int,
+    rtp_timestamp: int,
+    packet_count: int,
+    octet_count: int,
+) -> bytes:
+    """Build one RTCP Sender Report packet (RFC 3550 §6.4.1).
+
+    No report blocks (RC=0). The receiver only needs the SSRC + NTP/RTP
+    timestamp pair to anchor its playout clock; per-receiver block reports
+    are noise for a passive viewer.
+    """
+    ntp_msw, ntp_lsw = _ntp_timestamp_now()
+    first = 0x80  # V=2, P=0, RC=0
+    pt = 200  # PT for SR
+    length_in_words_minus_one = 6  # SR with RC=0 is 28 bytes = 7 words → 6
+    return struct.pack(
+        ">BBHIIIIII",
+        first,
+        pt,
+        length_in_words_minus_one,
+        ssrc & 0xFFFFFFFF,
+        ntp_msw,
+        ntp_lsw,
+        rtp_timestamp & 0xFFFFFFFF,
+        packet_count & 0xFFFFFFFF,
+        octet_count & 0xFFFFFFFF,
+    )
+
 
 @dataclass
 class _ParameterSets:
@@ -226,8 +302,8 @@ class _RtspSession:
         self.sequence_number = random.randint(0, 0xFFFF)
         # RTSP TCP-interleaved channel for RTP. Set during SETUP.
         self.rtp_channel: int | None = None
-        # RTCP channel (we don't actually emit RTCP, but we have to remember
-        # what the client asked for so it does not get confused).
+        # RTCP channel for our Sender Reports. Set during SETUP from the
+        # client's `interleaved=A-B` (B is RTCP).
         self.rtcp_channel: int | None = None
         self.queue: asyncio.Queue[_RtpFrame | None] = asyncio.Queue()
         self.playing = False
@@ -237,6 +313,25 @@ class _RtspSession:
         # has something to decode within a frame or two instead of waiting
         # for the next natural IDR.
         self.want_keyframe = True
+
+        # Pacer state — see _PACER_INITIAL_DELAY_NS for the rationale.
+        # Both fields are None until the first packet anchors the timeline.
+        self._paced_anchor_rtp_ts: int | None = None
+        self._paced_anchor_wall_ns: int | None = None
+
+        # Per-session cumulative counters used by RTCP SR (RFC 3550 §6.4.1
+        # requires "sender's packet count" and "sender's octet count" since
+        # the start of transmission for this SSRC). Octet count is the RTP
+        # *payload* count, not the framed-on-wire count.
+        self._packets_sent: int = 0
+        self._octets_sent: int = 0
+        # RTP timestamp of the most recently sent packet — paired with the
+        # NTP timestamp in the next SR to give the receiver a wall-clock
+        # anchor for playout pacing.
+        self._last_rtp_timestamp: int = 0
+        # Monotonic-ns timestamp of the last SR emission; 0 means "send the
+        # first SR as soon as there's anything to anchor".
+        self._last_sr_at_ns: int = 0
 
     def queue_frame(self, frame: _RtpFrame) -> None:
         if self._closed or not self.playing:
@@ -293,6 +388,20 @@ class _RtspSession:
                     # Client called PLAY without SETUP — should not happen,
                     # but discard rather than crash.
                     continue
+
+                # --- Pacer ----------------------------------------------
+                # Sleep until this packet's "correct" wall-clock target
+                # (derived from its RTP timestamp + the anchor). Packets
+                # within the same frame share a timestamp so they flush
+                # back-to-back; new frames wait their natural inter-frame
+                # delay. The browser's jitter buffer then sees a steady
+                # stream instead of Agora's burst-pause-burst delivery.
+                target_ns = self._compute_pacer_target_ns(item.timestamp)
+                sleep_ns = target_ns - time.monotonic_ns()
+                if sleep_ns > 0:
+                    await asyncio.sleep(min(sleep_ns, _PACER_MAX_SLEEP_NS) / 1e9)
+
+                # --- Build + send RTP -----------------------------------
                 packet = _build_rtp_packet(
                     payload=item.payload,
                     payload_type=RTSP_H265_PAYLOAD_TYPE,
@@ -302,7 +411,6 @@ class _RtspSession:
                     marker=item.marker,
                 )
                 self.sequence_number = (self.sequence_number + 1) & 0xFFFF
-                # Interleaved binary frame framing: $<channel><length BE><RTP>
                 framed = b"$" + bytes([self.rtp_channel]) + struct.pack(">H", len(packet)) + packet
                 try:
                     self.writer.write(framed)
@@ -315,10 +423,89 @@ class _RtspSession:
                         exc,
                     )
                     return
+
+                # --- Counters for the next SR ---------------------------
+                self._packets_sent += 1
+                self._octets_sent += len(item.payload)
+                self._last_rtp_timestamp = item.timestamp
+
+                # --- Periodic Sender Report -----------------------------
+                # Anchors RTP timestamps to wall-clock so the receiver's
+                # playout pacer (Chrome MSE / WebRTC, Frigate's ffmpeg)
+                # has a real-time reference instead of guessing from
+                # arrival deltas.
+                if (
+                    self.rtcp_channel is not None
+                    and time.monotonic_ns() - self._last_sr_at_ns
+                    >= _RTCP_SR_INTERVAL_NS
+                ):
+                    await self._send_sr_now()
         except asyncio.CancelledError:
             return
         except Exception:  # noqa: BLE001
             LOGGER.exception("RTSP session %s writer crashed", self.id)
+
+    def _compute_pacer_target_ns(self, rtp_timestamp: int) -> int:
+        """Return the monotonic-ns target send time for one outgoing packet.
+
+        First packet anchors the stream: target = now + initial delay. Each
+        subsequent packet's target moves forward from the anchor in
+        proportion to its RTP timestamp delta. If the delta is wildly
+        out-of-range (upstream session restart, ts wraparound, corrupt
+        packet) we re-anchor instead of trying to honour it.
+        """
+        now_ns = time.monotonic_ns()
+        if self._paced_anchor_rtp_ts is None or self._paced_anchor_wall_ns is None:
+            self._paced_anchor_rtp_ts = rtp_timestamp
+            self._paced_anchor_wall_ns = now_ns
+            return now_ns + _PACER_INITIAL_DELAY_NS
+
+        # Signed 32-bit delta — handles RTP timestamp wraparound naturally.
+        ts_delta = (rtp_timestamp - self._paced_anchor_rtp_ts) & 0xFFFFFFFF
+        if ts_delta > 0x80000000:
+            ts_delta -= 0x100000000
+
+        if abs(ts_delta) > _PACER_REANCHOR_THRESHOLD_TS:
+            # Upstream restart or timestamp jump — re-anchor on this packet.
+            LOGGER.debug(
+                "Pacer re-anchor on session %s: ts_delta=%d",
+                self.id,
+                ts_delta,
+            )
+            self._paced_anchor_rtp_ts = rtp_timestamp
+            self._paced_anchor_wall_ns = now_ns
+            return now_ns + _PACER_INITIAL_DELAY_NS
+
+        return (
+            self._paced_anchor_wall_ns
+            + _PACER_INITIAL_DELAY_NS
+            + int(ts_delta * 1_000_000_000 / _RTP_CLOCK_HZ)
+        )
+
+    async def _send_sr_now(self) -> None:
+        """Emit one RTCP Sender Report on the interleaved RTCP channel."""
+        if self.rtcp_channel is None:
+            return
+        sr_packet = _build_sr_packet(
+            ssrc=self.ssrc,
+            rtp_timestamp=self._last_rtp_timestamp,
+            packet_count=self._packets_sent,
+            octet_count=self._octets_sent,
+        )
+        framed_sr = (
+            b"$"
+            + bytes([self.rtcp_channel])
+            + struct.pack(">H", len(sr_packet))
+            + sr_packet
+        )
+        try:
+            self.writer.write(framed_sr)
+            await self.writer.drain()
+            self._last_sr_at_ns = time.monotonic_ns()
+        except (ConnectionError, BrokenPipeError, OSError) as exc:
+            LOGGER.debug(
+                "RTSP session %s SR write failed: %s", self.id, exc
+            )
 
 
 class Go2RtcRtspStream:

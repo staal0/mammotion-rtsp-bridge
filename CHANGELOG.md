@@ -6,6 +6,28 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-06-03
+
+### Added
+- **RTCP Sender Report generation** (RFC 3550 §6.4.1) — every 5 s on
+  the existing TCP-interleaved RTCP channel. SR carries the
+  NTP-timestamp ↔ RTP-timestamp pair the receiver's playout pacer
+  needs to render frames against a real-world clock. Without SR,
+  Chrome MSE / WebRTC players guess pacing from arrival times and the
+  jitter buffer thrashes — which produced the bursty
+  "3 fast flashes / pause / catch-up" rendering visible in Frigate's
+  inbound-rtp stats (`interFrameDelayStDev_in_ms` ~30-50 at 10 fps,
+  `pauseCount` >10).
+- **RTP pacer in the RTSP writer** — instead of forwarding packets the
+  moment they arrive (which mirrors Agora's bursty delivery to our
+  consumers), each packet is held until its RTP-timestamp-derived
+  wall-clock target. ~200 ms initial delay anchors the timeline;
+  packets within the same frame still flush back-to-back. Re-anchors
+  automatically on upstream session restart or timestamp wraparound.
+
+Both fixes operate entirely on the RTP transport layer — no
+transcoding, no codec touching, no upstream changes. Pure timing.
+
 ## [0.1.16] - 2026-06-03
 
 ### Removed
