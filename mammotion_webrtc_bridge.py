@@ -27,13 +27,20 @@ Environment variables:
   MAMMOTION_STREAM_NAME                    - go2rtc stream name (default mammotion)
   GO2RTC_API_URL                           - go2rtc REST base (default http://frigate:1984)
   MAMMOTION_GO2RTC_RECONCILE_SECONDS       - periodic re-register interval (default 20)
-  MAMMOTION_KEEPALIVE_SECONDS              - MQTT keep-alive interval (default 300)
+  MAMMOTION_KEEPALIVE_SECONDS              - MQTT keep-alive interval (default 10).
+                                             Must be well under the mower's
+                                             publisher-idle timeout (~50s) or
+                                             the publisher will leave the
+                                             channel between keep-alives and
+                                             we'll churn on cheap recovery.
   MAMMOTION_NO_RTP_WATCHDOG_SECONDS        - tear down upstream + reconnect if no
                                              H265 RTP packet for this many seconds
                                              (default 5)
-  MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS    - on stall, wait this long after a
-                                             refresh_fpv before escalating to a
-                                             full teardown (default 3)
+  MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS    - on stall, wait this long after the
+                                             cheap-recovery call
+                                             (refresh_stream_subscription)
+                                             before escalating to a full
+                                             teardown (default 5)
   MAMMOTION_DRY_RESTART_SECONDS            - if no H265 RTP at all for this many
                                              consecutive seconds, tear down the
                                              WHOLE bridge in-process (relay +
@@ -173,13 +180,22 @@ async def main() -> None:
         "go2rtc_reconcile_interval": float(
             _env_int("MAMMOTION_GO2RTC_RECONCILE_SECONDS", 20)
         ),
-        "keepalive_interval": float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 300)),
+        # 10 s keeps us well under Mammotion's ~50 s publisher-idle timeout.
+        # A 300 s default (a previous regression) left a ~4-minute window in
+        # every cycle where the mower received no "viewer present" signal
+        # and dropped its Agora publish, forcing the watchdog to recover
+        # every keepalive cycle — visible as constant cheap-recovery churn.
+        "keepalive_interval": float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 10)),
         "reconnect_backoff": _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8),
         "no_rtp_watchdog_seconds": float(
             _env_int("MAMMOTION_NO_RTP_WATCHDOG_SECONDS", 5)
         ),
+        # 5 s gives refresh_stream_subscription enough time to round-trip
+        # (HTTP token fetch + MQTT publish to mower + mower rejoin + first
+        # H265 packet back). The previous 3 s sometimes timed out before
+        # the recovery actually worked, leading to spurious full teardowns.
         "cheap_recovery_wait_seconds": float(
-            _env_int("MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS", 3)
+            _env_int("MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS", 5)
         ),
         # Dryness watchdog: when the in-relay reconnect loop has been unable
         # to fetch a single H265 packet for this many consecutive seconds,

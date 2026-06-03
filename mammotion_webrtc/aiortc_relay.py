@@ -323,17 +323,18 @@ class AgoraToRtspRelay:
                     tried_cheap_recovery = False
                     continue
 
-                # Stalled. First try a cheap recovery (refresh_fpv) — one
-                # MQTT message vs. tearing down the upstream + new Agora
-                # session + fresh credentials. Only escalate if that doesn't
-                # restore RTP within cheap_recovery_wait_seconds.
+                # Stalled. First try a cheap recovery — the bridge wires this
+                # to refresh_stream_subscription, which re-fetches a token and
+                # tells the mower to rejoin without us tearing down the
+                # upstream PC. Only escalate to a full teardown if that
+                # doesn't restore RTP within cheap_recovery_wait_seconds.
                 if (
                     not tried_cheap_recovery
                     and self._cheap_recovery is not None
                 ):
                     LOGGER.info(
                         "No upstream RTP for %.1fs; trying cheap recovery "
-                        "(refresh_fpv) before teardown",
+                        "before teardown",
                         idle_ns / 1e9,
                     )
                     tried_cheap_recovery = True

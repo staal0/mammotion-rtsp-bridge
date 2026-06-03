@@ -6,6 +6,22 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-06-03
+
+### Fixed
+- **Keepalive default restored to 10 s** (was a regressed 300 s). With a
+  300 s interval, we sent no "viewer present" signal for ~4 minutes out
+  of every 5, so the mower idle-dropped its publisher inside that window
+  and the watchdog had to fire cheap recovery every cycle. Visible in
+  logs as ~55 s of video followed by a stall, on repeat.
+- Cheap-recovery wait extended from 3 s → 5 s default.
+  `refresh_stream_subscription` is heavier than the old `refresh_fpv`
+  (HTTP token fetch + MQTT publish + mower rejoin) so the previous 3 s
+  window sometimes timed out before recovery actually completed,
+  triggering a spurious full teardown.
+- Cheap-recovery log line no longer references `refresh_fpv` (the
+  callback hasn't been `refresh_fpv` since v0.1.12).
+
 ## [0.1.12] - 2026-06-03
 
 ### Fixed
