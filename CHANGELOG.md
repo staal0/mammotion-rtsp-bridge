@@ -6,6 +6,23 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-06-03
+
+### Fixed
+- Recovery and wake paths no longer rely on `refresh_fpv`, which per
+  upstream (mikey0000 in [#repo]) is a no-op for mowers on WiFi. This is
+  why the in-relay cheap-recovery and wake_publisher steps appeared to
+  do nothing for WiFi-connected mowers and we kept falling through to
+  full upstream teardowns. The bridge now uses pymammotion's
+  `refresh_stream_subscription` (the documented "reconnect user 1" path,
+  works on both WiFi and 4G) as the primary mechanism for cheap-recovery
+  and wake_publisher, with `refresh_fpv` kept only as a best-effort
+  secondary call.
+- Keep-alive loop simplified to send `send_todev_ble_sync sync_type=2`
+  unconditionally (was previously preferring `refresh_fpv` and only
+  falling back to ble_sync). The BLE sync works on both transports;
+  refresh_fpv now follows as a best-effort secondary.
+
 ## [0.1.11] - 2026-06-01
 
 ### Added
