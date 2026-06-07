@@ -98,12 +98,31 @@ class AgoraToRtspRelay:
         # behalf of new RTSP clients. None until the first packet arrives.
         self._video_ssrc: int | None = None
         # Monotonic-ns timestamp of the last forwarded H265 RTP packet. Used
-        # by the in-relay no-RTP watchdog (tears down + reconnects) AND by
-        # the bridge-level dryness watchdog (restarts the whole process when
-        # in-relay recovery has stopped working — see seconds_since_last_rtp).
-        # Initialised to "now" so a bootstrap that never produces video also
-        # ages out, instead of looking infinitely stale from t=0.
+        # by the in-relay no-RTP watchdog (tears down + reconnects) to detect
+        # mid-stream stalls. The bridge-level dryness watchdog instead keys off
+        # _last_healthy_ns below (see seconds_since_healthy) so it isn't fooled
+        # by churn trickle. Initialised to "now" so a bootstrap that never
+        # produces video also ages out, instead of looking stale from t=0.
         self._last_rtp_ns: int = time.monotonic_ns()
+        # Monotonic-ns timestamp of the last *sustained* (healthy) RTP. Unlike
+        # ``_last_rtp_ns``, a lone trickle packet does NOT advance this — only
+        # a cycle that has forwarded at least ``_healthy_packet_threshold``
+        # packets counts. The bridge-level dryness watchdog keys off this so
+        # the "publisher is join/quit churning and dribbling one IDR every
+        # 60-90s" failure mode (which kept resetting ``_last_rtp_ns`` and so
+        # defeated the watchdog) still ages out and triggers a full
+        # in-process restart. Initialised to "now" so a bootstrap that never
+        # streams also ages out instead of looking healthy from t=0.
+        self._last_healthy_ns: int = time.monotonic_ns()
+        # Packets forwarded in the current upstream cycle. Reset at the top of
+        # each ``_run_one_upstream``. Used to classify a cycle as healthy (a
+        # real stream) vs a trickle (churn) for both ``_last_healthy_ns`` and
+        # the supervisor's backoff regime.
+        self._cycle_packets: int = 0
+        # ~4s of video at the mower's ~10-40 pps. Above this a cycle is a
+        # genuine stream; at or below it's churn (a stray IDR or two from a
+        # publisher that quit ~1s after joining).
+        self._healthy_packet_threshold: int = 150
         # Throughput counters incremented in the RTP tap and sampled by the
         # heartbeat. Lifetime totals (across all reconnect cycles) so the
         # heartbeat can show "yes the process is still doing useful work"
@@ -133,6 +152,19 @@ class AgoraToRtspRelay:
         stuck MQTT, mower needing a full cloud-side wake).
         """
         return (time.monotonic_ns() - self._last_rtp_ns) / 1e9
+
+    @property
+    def seconds_since_healthy(self) -> float:
+        """Wall-clock seconds since we last had a *sustained* H265 stream.
+
+        Advances only while a cycle is streaming real video (>=
+        ``_healthy_packet_threshold`` packets), so a publisher that joins and
+        quits ~1s later — dribbling a stray IDR each time — does NOT keep this
+        clock fresh. That is the distinction the bridge dryness watchdog needs:
+        ``seconds_since_last_rtp`` is reset by those trickle packets and so
+        never trips, while this keeps climbing until a genuine stream returns.
+        """
+        return (time.monotonic_ns() - self._last_healthy_ns) / 1e9
 
     async def start(self) -> None:
         if self._supervisor_task is not None and not self._supervisor_task.done():
@@ -244,7 +276,7 @@ class AgoraToRtspRelay:
         #     wake a sleeping mower and burns the pymammotion 300/24h budget.
         offline_backoff = self._reconnect_backoff
         while not self._stop_event.is_set():
-            got_rtp_this_cycle = False
+            healthy_this_cycle = False
             try:
                 await self._run_one_upstream()
             except asyncio.CancelledError:
@@ -252,29 +284,39 @@ class AgoraToRtspRelay:
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Upstream connection failed")
             finally:
-                # _video_ssrc is set by the RTP tap on the first H265 packet
-                # of a cycle and cleared by _teardown_upstream — so we have to
-                # capture it before teardown runs.
-                got_rtp_this_cycle = self._video_ssrc is not None
+                # _cycle_packets is reset at the top of _run_one_upstream and
+                # not touched by teardown, so it's still valid here. We treat a
+                # cycle as healthy only if it carried a *sustained* stream —
+                # not a stray IDR or two from a publisher that quit ~1s after
+                # joining. Fast-retrying those trickle cycles is what used to
+                # hammer the cloud (a wake + a stream-token fetch every ~1s),
+                # which on an old-firmware device burns pymammotion's 300/24h
+                # MQTT send budget and ends in a 12h self-imposed ban.
+                healthy_this_cycle = (
+                    self._cycle_packets >= self._healthy_packet_threshold
+                )
                 await self._teardown_upstream()
 
-            if got_rtp_this_cycle:
-                # Publisher stall — reset the offline ramp and retry fast.
+            if healthy_this_cycle:
+                # Genuine mid-stream stall after real video — reset the ramp
+                # and retry fast; the mower is reachable, just paused.
                 backoff = self._reconnect_backoff
                 offline_backoff = self._reconnect_backoff
                 LOGGER.info(
                     "Publisher stalled mid-stream; retrying in %.1fs", backoff
                 )
             else:
-                # No video this cycle. Mower likely offline or refusing to
-                # publish. Use the ramped backoff, then escalate for next time.
+                # No sustained video this cycle — mower offline, refusing to
+                # publish, or join/quit churning. Ramp the backoff so we don't
+                # poke the cloud (and spend MQTT budget) on a tight loop.
                 backoff = offline_backoff
                 offline_backoff = min(
                     offline_backoff * 2, self._max_reconnect_backoff
                 )
                 LOGGER.warning(
-                    "Mower appears offline (no video received this cycle); "
-                    "backing off %.1fs (next attempt's backoff: %.1fs)",
+                    "No sustained video this cycle (mower offline or "
+                    "join/quit churning); backing off %.1fs "
+                    "(next attempt's backoff: %.1fs)",
                     backoff,
                     offline_backoff,
                 )
@@ -291,6 +333,10 @@ class AgoraToRtspRelay:
     async def _run_one_upstream(self) -> None:
         """Bring up one Agora subscription and pump RTP until it dies."""
         LOGGER.info("Starting upstream Agora subscription")
+        # Zero the per-cycle tally up front so a cycle that fails before the
+        # track arrives (e.g. signaling timeout) can't inherit the previous
+        # cycle's count and be misclassified as healthy by the supervisor.
+        self._cycle_packets = 0
 
         if self._publisher_wakeup is not None:
             try:
@@ -495,7 +541,16 @@ class AgoraToRtspRelay:
                     if ssrc_just_learned:
                         relay_self._video_ssrc = effective.ssrc
                     if effective.payload:
-                        relay_self._last_rtp_ns = time.monotonic_ns()
+                        now_ns = time.monotonic_ns()
+                        relay_self._last_rtp_ns = now_ns
+                        relay_self._cycle_packets += 1
+                        # Only a sustained stream advances the health clock;
+                        # the first trickle packets of a churn cycle do not.
+                        if (
+                            relay_self._cycle_packets
+                            >= relay_self._healthy_packet_threshold
+                        ):
+                            relay_self._last_healthy_ns = now_ns
                         relay_self._packets_forwarded += 1
                         relay_self._bytes_forwarded += len(effective.payload)
                         rtsp_server.push_rtp(

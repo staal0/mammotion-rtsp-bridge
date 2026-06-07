@@ -6,6 +6,50 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-06-07
+
+### Fixed
+- **Stream no longer dies on a WiFi mower** (and revives
+  only on a container restart). Root cause was the same 300-sends/24h MQTT
+  budget v0.1.18 fixed for the keepalive — but the **recovery and wake paths
+  were still spending it**, and on a mower that join/quit churns (common
+  since losing 4G) they fire constantly:
+  - `wake_publisher` ran on every full-teardown reconnect and sent
+    `send_todev_ble_sync(sync_type=3)` **+ `refresh_fpv` + `refresh_stream_subscription`**
+    via the budgeted `send_command_with_args`.
+  - the in-relay watchdog fired `refresh_stream_subscription` on every ~5s
+    stall; on old-firmware devices that sends a budgeted
+    `device_agora_join_channel_with_position` command.
+
+  Once 300 sends accumulate, pymammotion's transport **self-imposes a 12h
+  rate-limit ban** (`Transport._RATE_LIMIT_DURATION = 43200`). All
+  reconnect commands then silently no-op and the stream stays dead until the
+  in-process send counter resets — which only happens on a fresh
+  `MammotionClient`, i.e. a container restart. Changes:
+  - **Removed `refresh_fpv` entirely.** It's a no-op on WiFi (per upstream)
+    yet cost a budgeted MQTT send on every reconnect — pure drain for a
+    mower without 4G.
+  - **Wake `ble_sync sync_type=3` now goes through the heartbeat path**
+    (`send_heartbeat`, which skips `record_send()`), so it no longer counts
+    against the budget.
+  - **`refresh_stream_subscription` is debounced** to once per 20s
+    (`REFRESH_SUB_DEBOUNCE_S`) so a flapping publisher can't drive the
+    budget down.
+
+- **The dryness watchdog now actually fires under churn.** It keyed off
+  `seconds_since_last_rtp`, but a join/quit-churning publisher dribbles a
+  stray IDR every 60-90s, which kept resetting that clock so the watchdog
+  never tripped — defeating the one escape hatch (a fresh in-process
+  re-login, which resets the budget counter). It now keys off
+  `seconds_since_healthy`, a clock that only advances during a *sustained*
+  stream (≥150 packets/cycle). Under churn it ages out and the bridge
+  re-logs in fresh — the automatic equivalent of the manual restart.
+
+- **Backoff no longer fast-retries churn cycles.** A cycle that carried only
+  a trickle (not a real stream) is now treated like "mower offline" — ramped
+  backoff instead of the 1s fast-retry — so we stop hammering the cloud (and
+  spending budget) on a tight loop while the publisher flaps.
+
 ## [0.1.18] - 2026-06-03
 
 ### Fixed
