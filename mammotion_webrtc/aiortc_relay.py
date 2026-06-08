@@ -264,8 +264,8 @@ class AgoraToRtspRelay:
     # ------------------------------------------------------------------
 
     async def _supervise(self) -> None:
-        # Two backoff regimes, picked per cycle by whether any H265 RTP packet
-        # arrived this round:
+        # Two backoff regimes, picked per cycle by whether this attempt reached
+        # a sustained healthy stream (_cycle_packets >= _healthy_packet_threshold):
         #
         #   * Publisher stall (we did get RTP, then it stopped) — fast recovery
         #     at the immediate ``reconnect_backoff_seconds``. The mower is
