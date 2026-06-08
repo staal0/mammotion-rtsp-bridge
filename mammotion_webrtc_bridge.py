@@ -41,15 +41,22 @@ Environment variables:
                                              (refresh_stream_subscription)
                                              before escalating to a full
                                              teardown (default 5)
-  MAMMOTION_DRY_RESTART_SECONDS            - if no H265 RTP at all for this many
-                                             consecutive seconds, tear down the
-                                             WHOLE bridge in-process (relay +
-                                             RTSP + pymammotion login) and
+  MAMMOTION_DRY_RESTART_SECONDS            - if no *sustained* H265 stream
+                                             (i.e. ``seconds_since_healthy``,
+                                             which only advances during a real
+                                             stream and is unaffected by churn
+                                             trickle) for this many consecutive
+                                             seconds, tear down the WHOLE
+                                             bridge in-process (relay + RTSP +
+                                             pymammotion login) and
                                              re-bootstrap from scratch. Escapes
                                              the "stuck for hours" failure mode
                                              where the in-relay reconnect loop
                                              can't wake the publisher because
-                                             of a stale cloud session.
+                                             of a stale cloud session — and
+                                             resets pymammotion's per-client
+                                             send counter so we get out from
+                                             under the 300-sends/24h MQTT ban.
                                              Default 180. Works without any
                                              docker restart policy — no process
                                              exit, just an in-process reset.

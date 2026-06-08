@@ -101,20 +101,31 @@ Three layers of recovery, each handling a different failure class:
    `pymammotion.refresh_stream_subscription` — that re-fetches a token AND
    tells the mower to rejoin Agora, all over the existing MQTT session
    without tearing down the upstream PC. Recovers from "publisher idle-timed
-   out" in 1-2 s.
+   out" in 1-2 s. The call is debounced to once per 20 s so a flapping
+   publisher can't drive pymammotion's 300-sends/24 h MQTT budget down.
 2. **Full upstream teardown.** If cheap recovery didn't restore packets
    within `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS` (default 5 s), the relay
    tears down the upstream PC and reconnects from scratch with fresh
-   credentials. Recovers from genuine ICE/DTLS or token-expiry failures.
-3. **In-process bridge restart.** If those still haven't brought RTP back
-   after `MAMMOTION_DRY_RESTART_SECONDS` (default 180 s), the bridge tears
-   down everything *including* the pymammotion client and re-bootstraps from
-   a fresh cloud login inside the same process. Escapes "stale session"
-   failure modes the in-relay loop can't recover from. No `sys.exit`, so it
+   credentials. Cycles that produced only a trickle of RTP (a stray IDR or
+   two before the publisher quit) are treated like "mower offline" with a
+   ramped backoff — only cycles that streamed real video (≥150 packets) get
+   the 1 s fast-retry path.
+3. **In-process bridge restart.** If a *sustained* stream hasn't been seen
+   for `MAMMOTION_DRY_RESTART_SECONDS` (default 180 s) — and this clock is
+   not advanced by churn trickle — the bridge tears down everything
+   *including* the pymammotion client and re-bootstraps from a fresh cloud
+   login inside the same process. This also resets pymammotion's per-client
+   send counter, which is the only thing that escapes the transport's
+   self-imposed 12 h ban once 300 sends accumulate. No `sys.exit`, so it
    works without any Docker restart policy.
 
 Other reliability bits:
 
+- The steady-state MQTT keepalive (`ble_sync sync_type=2`) and the
+  publisher-wake nudge (`sync_type=3`) both go through pymammotion's
+  budget-free heartbeat path (`Transport.send_heartbeat` skips
+  `record_send()`), so the 10 s keepalive cadence doesn't burn through the
+  300-sends/24 h MQTT budget.
 - A **heartbeat INFO line** every 60 s summarises steady-state health
   (upstream state, last-RTP age, pps, kbps, lifetime packet count, RTSP
   client count). If you tail the log and these go silent, something's wrong.
@@ -128,9 +139,6 @@ Other reliability bits:
 - **H265 only.** Mammotion's camera publishes H265; this bridge does not
   transcode. Consumers that need H264 should put a transcoder downstream (or
   use the Frigate `ffmpeg`-based hwaccel preset to record/restream as H264).
-- **No RTCP Sender Reports.** go2rtc gets RTP timestamps without a wall-clock
-  anchor. This is fine for Frigate (which timestamps on arrival) but can
-  cause MSE-mode browser playback to drift over long sessions.
 - **Single device per container.** Run one container per mower.
 - **Local-only is not possible.** All Mammotion video is brokered through
   Agora's cloud; there is no documented LAN-direct path today.

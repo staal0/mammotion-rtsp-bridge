@@ -29,3 +29,24 @@ cameras:
       width: 640
       height: 480
       fps: 5
+
+# ---------------------------------------------------------------------------
+# Alternative: record-only (no object detection)
+# ---------------------------------------------------------------------------
+# If you just want continuous recording without running Frigate's object
+# detector against the mower feed (saves CPU/iGPU and avoids false detects
+# from grass/mower geometry), drop the `detect` role and `detect:` block, and
+# turn detection off explicitly. Replace the whole block above with:
+#
+# cameras:
+#   mammotion:
+#     ffmpeg:
+#       inputs:
+#         - path: rtsp://127.0.0.1:8554/mammotion
+#           input_args: preset-rtsp-restream
+#           roles:
+#             - record
+#     detect:
+#       enabled: false
+#     record:
+#       enabled: true
