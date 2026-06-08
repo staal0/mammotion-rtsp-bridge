@@ -76,7 +76,7 @@ docker compose up -d mammotion-bridge
 | `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keepalive to the mower. Stays well under the publisher-idle timeout (~50 s) so the mower keeps publishing between recoveries |
 | `MAMMOTION_NO_RTP_WATCHDOG_SECONDS` | `5` | If no H265 RTP arrives for this long, trigger an in-relay cheap recovery (`refresh_stream_subscription`); escalate to a full teardown if that doesn't restore packets |
 | `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS` | `5` | How long to wait after a cheap-recovery call before judging it failed |
-| `MAMMOTION_DRY_RESTART_SECONDS` | `180` | If no H265 RTP at all for this many seconds, tear the whole bridge down in-process (relay + RTSP + pymammotion client) and re-bootstrap from a fresh cloud login. Escape from "stale cloud session, in-relay recovery isn't working" failure modes. No process exit — works regardless of Docker restart policy |
+| `MAMMOTION_DRY_RESTART_SECONDS` | `90` | If no *sustained* H265 stream (i.e. `seconds_since_healthy`, unaffected by churn trickle) for this many seconds, tear the whole bridge down in-process (relay + RTSP + pymammotion client) and re-bootstrap from a fresh cloud login. Escape from "stale cloud session, in-relay recovery isn't working" failure modes; also resets pymammotion's per-client send counter to escape the 300-sends/24 h MQTT ban. No process exit — works regardless of Docker restart policy |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Retry delay on cloud/session failure |
 | `MAMMOTION_LOG_LEVEL` | `INFO` | `DEBUG` exposes the per-message join-loop body dumps and RTSP method exchange |
 
@@ -111,7 +111,7 @@ Three layers of recovery, each handling a different failure class:
    ramped backoff — only cycles that streamed real video (≥150 packets) get
    the 1 s fast-retry path.
 3. **In-process bridge restart.** If a *sustained* stream hasn't been seen
-   for `MAMMOTION_DRY_RESTART_SECONDS` (default 180 s) — and this clock is
+   for `MAMMOTION_DRY_RESTART_SECONDS` (default 90 s) — and this clock is
    not advanced by churn trickle — the bridge tears down everything
    *including* the pymammotion client and re-bootstraps from a fresh cloud
    login inside the same process. This also resets pymammotion's per-client

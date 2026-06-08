@@ -57,9 +57,15 @@ Environment variables:
                                              resets pymammotion's per-client
                                              send counter so we get out from
                                              under the 300-sends/24h MQTT ban.
-                                             Default 180. Works without any
-                                             docker restart policy — no process
-                                             exit, just an in-process reset.
+                                             Default 90 (v0.1.19+ keys this
+                                             off seconds_since_healthy, which
+                                             only advances during real
+                                             streams, so a 90 s threshold is
+                                             as honest as 180 s used to be on
+                                             the old churn-defeated clock).
+                                             Works without any docker restart
+                                             policy — no process exit, just
+                                             an in-process reset.
   MAMMOTION_RECONNECT_BACKOFF_SECONDS      - login retry backoff (default 8)
 """
 
@@ -226,7 +232,7 @@ async def main() -> None:
         # without ``restart: unless-stopped`` don't end up with a crashed
         # container.
         "dry_restart_seconds": float(
-            _env_int("MAMMOTION_DRY_RESTART_SECONDS", 180)
+            _env_int("MAMMOTION_DRY_RESTART_SECONDS", 90)
         ),
     }
 

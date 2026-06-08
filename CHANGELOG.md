@@ -6,6 +6,29 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-06-08
+
+### Changed
+- **`MAMMOTION_DRY_RESTART_SECONDS` default lowered 180 → 90 seconds.**
+  v0.1.19 re-keyed the dry-restart watchdog off `seconds_since_healthy`
+  (only advances during a sustained ≥150-pkt cycle) instead of
+  `seconds_since_last_rtp` (which churn trickle kept resetting). On the
+  honest healthy-clock, 90 s of no sustained stream is as strong a
+  signal as 180 s used to be on the churn-defeated clock — so faster
+  escape from stale-session / budget-ban failure modes without losing
+  detection confidence.
+
+  Trade-off (FYI, not a regression): during a *genuinely* prolonged
+  mower-offline period the dry-restart timer will re-fire twice as often
+  (~every 90 s instead of 180 s). Each bootstrap is one
+  `MammotionClient` cloud login + `get_stream_subscription`; both go
+  through the per-cycle 8 s login backoff so the floor is gated. If
+  this turns out to matter, the follow-up is to ramp the dry-restart
+  cadence on consecutive failed bootstraps — that's a separate patch.
+
+  Override with `MAMMOTION_DRY_RESTART_SECONDS=180` to restore prior
+  behaviour.
+
 ## [0.1.19] - 2026-06-07
 
 ### Fixed
@@ -432,7 +455,8 @@ First public release. Experimental.
 - Example configs for Frigate and standalone go2rtc, plus a documented HA
   advanced-camera-card snippet.
 
-[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.20
 [0.1.9]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.9
 [0.1.8]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.8
 [0.1.7]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.7
