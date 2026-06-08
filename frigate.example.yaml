@@ -4,20 +4,28 @@
 # (see GO2RTC_API_URL in docker-compose.example.yml), so you usually do NOT
 # need a `go2rtc:` streams block at all. This snippet only shows the `cameras:`
 # wiring so Frigate uses the resulting restream.
+#
+# Tested against a Luba Mini AWD (onboard camera: native 640x480 4:3 H265
+# ~10 fps). Adjust the detect dims to your model's camera if different.
 
 cameras:
   mammotion:
     ffmpeg:
-      # H265 hwaccel preset. Pick the one matching your platform:
-      #   Intel iGPU: preset-intel-qsv-h265 | NVIDIA: preset-nvidia | none: omit.
-      hwaccel_args: preset-intel-qsv-h265
+      # Optional H265 hwaccel preset — pick the one matching your platform and
+      # uncomment if you want GPU-assisted decode (helps if detect is enabled):
+      #   Intel iGPU: preset-intel-qsv-h265 | NVIDIA: preset-nvidia
+      # hwaccel_args: preset-intel-qsv-h265
       inputs:
         # Frigate restreams go2rtc on 127.0.0.1:8554 — `mammotion` here matches
         # MAMMOTION_STREAM_NAME from the bridge env (default: `mammotion`).
         - path: rtsp://127.0.0.1:8554/mammotion
           input_args: preset-rtsp-restream
-          roles: [record]
+          roles:
+            - detect
+            - record
+    # Luba Mini AWD onboard camera is native 640x480 (4:3) H265 ~10 fps.
+    # Override the global 16:9 detect dims so the 4:3 frame isn't squashed.
     detect:
-      enabled: false
-    record:
-      enabled: true
+      width: 640
+      height: 480
+      fps: 5

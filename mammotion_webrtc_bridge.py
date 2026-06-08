@@ -81,6 +81,13 @@ LOGGER = logging.getLogger("mammotion_webrtc_bridge")
 # to avoid an account lockout.
 CREDS_DEBOUNCE_S = 15.0
 
+# Minimum seconds between refresh_stream_subscription calls. On old-firmware
+# devices this sends a budgeted MQTT join command (see _refresh_stream_subscription),
+# so re-poking faster than this on a churning mower would exhaust pymammotion's
+# 300-sends/24h budget and trip a 12h self-imposed ban. Kept comfortably above
+# the watchdog's stall cadence so a flapping publisher can't drive it.
+REFRESH_SUB_DEBOUNCE_S = 20.0
+
 # Mirrors the AREA_CODE_MAP in the main-branch bridge, but maps to the
 # "CN,GLOBAL"-style strings the REST choose_server API expects.
 AREA_CODE_STRING_MAP = {
@@ -144,7 +151,7 @@ def _env_int(name: str, default: int) -> int:
 class _DryWatchdogTripped(Exception):
     """Internal signal: no H265 RTP for too long → full in-process restart.
 
-    Raised from the keep-alive loop when ``relay.seconds_since_last_rtp``
+    Raised from the keep-alive loop when ``relay.seconds_since_healthy``
     exceeds ``MAMMOTION_DRY_RESTART_SECONDS``. The outer ``main`` loop
     catches it, tears down the current session (relay, RTSP server,
     pymammotion client), and re-enters :func:`_run_bridge_session` with
@@ -284,6 +291,7 @@ async def _run_bridge_session(
         "iot_id": None,
         "credentials": None,
         "creds_fetched_at": 0.0,
+        "refresh_sub_at": 0.0,
     }
 
     async def _fresh_client() -> Any | None:
@@ -348,47 +356,45 @@ async def _run_bridge_session(
                 raise
         return state["credentials"]
 
-    async def _refresh_fpv() -> bool:
-        """Tell the mower's multimedia SoC to re-enable the encode stream.
-
-        Sends ``MulSetEncode(encode=True)`` via pymammotion's ``refresh_fpv``.
-        Per upstream (mikey0000), this command is a no-op for mowers on WiFi
-        and only takes effect over 4G — so we keep it as a best-effort
-        secondary, never as the only recovery action. Always returns True/False
-        with no exception bubbling; callers must not depend on it succeeding.
-        """
-        mammotion = state["mammotion"]
-        device = state.get("device_name")
-        if mammotion is None or not device:
-            return False
-        try:
-            await mammotion.send_command_with_args(device, "refresh_fpv")
-            return True
-        except AttributeError:
-            LOGGER.debug(
-                "refresh_fpv not available in this pymammotion version", exc_info=True
-            )
-            return False
-        except Exception:
-            LOGGER.debug("refresh_fpv send failed", exc_info=True)
-            return False
-
     async def _refresh_stream_subscription() -> bool:
         """Renew the Agora stream token and force the mower to (re)join.
 
         Wraps pymammotion's ``refresh_stream_subscription`` — this is the
         documented way to reconnect user 1 (the publisher) and works on both
-        WiFi and 4G (unlike ``refresh_fpv``). On success we also update the
-        cached credentials so the next supervisor reconnect uses the fresh
-        token instead of the stale one we already burned.
+        WiFi and 4G (unlike the now-removed ``refresh_fpv``, which only ever
+        took effect over 4G). On success we also update the cached credentials
+        so the next supervisor reconnect uses the fresh token instead of the
+        stale one we already burned.
 
-        Returns True on success, False on any error.
+        DEBOUNCED. For old-firmware devices pymammotion's
+        ``refresh_stream_subscription`` sends an MQTT
+        ``device_agora_join_channel_with_position`` command that counts
+        against the 300-sends/24h budget; firing it on every ~5s watchdog
+        stall (the prior behaviour) burned the whole budget in well under an
+        hour on a churning WiFi mower, after which the transport self-imposed
+        a 12h ban and the stream died until a container restart. The debounce
+        caps how fast we can re-poke the cloud; the bridge dryness watchdog is
+        the real escape hatch for a wedged session (it re-logs in fresh, which
+        resets the in-process budget counter).
+
+        Returns True on success (or when skipped by the debounce), False on
+        any error.
         """
         mammotion = state["mammotion"]
         device = state.get("device_name")
         iot_id = state.get("iot_id")
         if mammotion is None or not device or not iot_id:
             return False
+        now = loop.time()
+        last = state.get("refresh_sub_at", 0.0)
+        if now - last < REFRESH_SUB_DEBOUNCE_S:
+            LOGGER.debug(
+                "Skipping refresh_stream_subscription (debounced, %.0fs < %.0fs)",
+                now - last,
+                REFRESH_SUB_DEBOUNCE_S,
+            )
+            return True
+        state["refresh_sub_at"] = now
         try:
             response = await mammotion.refresh_stream_subscription(device, iot_id)
         except AttributeError:
@@ -418,8 +424,12 @@ async def _run_bridge_session(
                 state["creds_fetched_at"] = loop.time()
         return True
 
-    async def _send_keepalive_heartbeat() -> bool:
-        """Send a ``ble_sync sync_type=2`` ping that doesn't burn the cloud budget.
+    async def _send_ble_sync_heartbeat(sync_type: int = 2) -> bool:
+        """Send a ``ble_sync`` ping that doesn't burn the cloud budget.
+
+        ``sync_type=2`` is the steady-state keepalive; ``sync_type=3`` is the
+        wake nudge used during recovery. Both go through pymammotion's
+        heartbeat path so neither counts against the 300-sends/24h MQTT budget.
 
         pymammotion's MQTT transports cap user-initiated sends at 300 per
         24 h ("self-imposing rate limit" warning). Calling
@@ -446,12 +456,12 @@ async def _run_bridge_session(
             # only fails at the first heartbeat tick, not at bridge startup.
             from pymammotion.proto import TransportType
         except Exception:  # noqa: BLE001
-            return await _fallback_keepalive_via_command(mammotion, device)
+            return await _fallback_ble_sync_via_command(mammotion, device, sync_type)
         try:
             handle = mammotion.device_registry.get_by_name(device)
             if handle is None:
                 return False
-            cmd_bytes = handle.commands.send_todev_ble_sync(sync_type=2)
+            cmd_bytes = handle.commands.send_todev_ble_sync(sync_type=sync_type)
             # Prefer Aliyun MQTT (the rate-limited transport we're worried
             # about); fall back to the other cloud transport if Aliyun isn't
             # currently connected. Either accepts ble_sync just fine.
@@ -467,24 +477,26 @@ async def _run_bridge_session(
                 "heartbeat path unavailable in this pymammotion; using send_command_with_args",
                 exc_info=True,
             )
-            return await _fallback_keepalive_via_command(mammotion, device)
+            return await _fallback_ble_sync_via_command(mammotion, device, sync_type)
         except Exception:
-            LOGGER.debug("Heartbeat keepalive failed", exc_info=True)
+            LOGGER.debug("ble_sync heartbeat failed", exc_info=True)
             return False
 
-    async def _fallback_keepalive_via_command(mammotion: Any, device: str) -> bool:
-        """Legacy keepalive path — counts against the 300/24 h budget.
+    async def _fallback_ble_sync_via_command(
+        mammotion: Any, device: str, sync_type: int
+    ) -> bool:
+        """Legacy ble_sync path — counts against the 300/24 h budget.
 
         Only invoked if the heartbeat path isn't available in the installed
         pymammotion version. Same wire effect, just rate-limited.
         """
         try:
             await mammotion.send_command_with_args(
-                device, "send_todev_ble_sync", sync_type=2
+                device, "send_todev_ble_sync", sync_type=sync_type
             )
             return True
         except Exception:
-            LOGGER.debug("Fallback keepalive failed", exc_info=True)
+            LOGGER.debug("Fallback ble_sync failed", exc_info=True)
             return False
 
     async def wake_publisher() -> None:
@@ -494,29 +506,28 @@ async def _run_bridge_session(
 
         1. ``send_todev_ble_sync sync_type=3`` — BLE-over-MQTT wake. Useful
            if the mower itself has gone to sleep (not just the publisher).
+           Sent via the heartbeat path so it doesn't count against the
+           300-sends/24h MQTT budget — this runs on every reconnect, so on a
+           flapping WiFi mower the old budgeted send was a steady drain.
         2. ``refresh_stream_subscription`` — pymammotion's documented way to
            reconnect user 1. Works on both WiFi and 4G. This is the actual
            workhorse and replaces what we used to do with an explicit
            ``device_agora_join_channel_with_position`` call (which is now
            sent for us by ``refresh_stream_subscription`` on old-firmware
-           devices and unnecessary on new ones).
-        3. ``refresh_fpv`` — best-effort secondary that nudges the encoder
-           on 4G mowers. No-op on WiFi per upstream, but harmless.
+           devices and unnecessary on new ones). Debounced internally.
 
-        All three are best-effort; failures don't block negotiation.
+        ``refresh_fpv`` used to be a third step here; it was removed because
+        it's a no-op on WiFi (per upstream) yet still spent a budgeted MQTT
+        send on every reconnect — pure drain for a mower without 4G.
+
+        Both are best-effort; failures don't block negotiation.
         """
         mammotion = state["mammotion"]
         device = state.get("device_name")
         if mammotion is None or not device:
             return
-        try:
-            await mammotion.send_command_with_args(
-                device, "send_todev_ble_sync", sync_type=3
-            )
-        except Exception:
-            LOGGER.debug("BLE sync wake-up failed", exc_info=True)
+        await _send_ble_sync_heartbeat(sync_type=3)
         await _refresh_stream_subscription()
-        await _refresh_fpv()
 
     # Construct the RTSP server now so the relay can hold a reference even
     # before we know the port is bound — start()/stop() are explicit below.
@@ -600,10 +611,19 @@ async def _run_bridge_session(
             # Dryness check before anything else so a stuck session does not
             # waste a keep-alive cycle on a doomed cloud client. ``finally``
             # below handles teardown of everything we built in this session.
-            dryness = relay.seconds_since_last_rtp
+            #
+            # Keyed off seconds_since_*healthy*, not seconds_since_last_rtp:
+            # a join/quit-churning publisher dribbles a stray IDR every
+            # 60-90s, which kept resetting the last-RTP clock and so the
+            # watchdog never fired — the bridge sat wedged "for all eternity"
+            # while the 300/24h MQTT budget stayed exhausted. The health clock
+            # only advances on a sustained stream, so it ages out under churn
+            # and we re-login fresh (which resets pymammotion's in-process
+            # send-budget counter — the same thing a container restart does).
+            dryness = relay.seconds_since_healthy
             if dryness > dry_restart_seconds:
                 raise _DryWatchdogTripped(
-                    f"no H265 RTP for {dryness:.0f}s "
+                    f"no sustained H265 RTP for {dryness:.0f}s "
                     f"(threshold {dry_restart_seconds:.0f}s)"
                 )
 
@@ -651,7 +671,7 @@ async def _run_bridge_session(
                 # No refresh_fpv on this path: it counts against the
                 # budget AND is a no-op on WiFi (per upstream), so it
                 # bought us nothing while costing 50% of our 24h budget.
-                sent = await _send_keepalive_heartbeat()
+                sent = await _send_ble_sync_heartbeat(sync_type=2)
                 if not sent:
                     LOGGER.debug(
                         "Keepalive heartbeat failed; dropping client to re-login"

@@ -37,3 +37,7 @@ wstest.html
 .claude/
 .DS_Store
 Thumbs.db
+
+# Saved docker image tarballs (docker save)
+*.tar.gz
+*.tar
