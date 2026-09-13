@@ -94,6 +94,10 @@ _PACER_MAX_SLEEP_NS = 1_000_000_000  # 1 s
 # Chrome/MSE renders bursty; 5 s is what most production RTSP servers use.
 _RTCP_SR_INTERVAL_NS = 5_000_000_000
 
+# How long a session waits for an IRAP after PLAY before giving up and
+# forwarding mid-GOP anyway.
+_KEYFRAME_GATE_TIMEOUT_NS = 3_000_000_000  # 3 s
+
 # NTP epoch offset: seconds between 1900-01-01 and 1970-01-01.
 _NTP_EPOCH_OFFSET = 2_208_988_800
 
@@ -229,9 +233,8 @@ def _is_h265_irap(payload: bytes) -> bool:
     """Best-effort IRAP detection for one RTP payload.
 
     Catches IRAPs that arrive as a single NAL or as the first fragment of
-    a FU. AP-wrapped IRAPs are caught by scanning the inner NALs. False
-    negatives are fine: we use this only to opportunistically PLI upstream
-    when we have not seen a keyframe recently.
+    a FU. AP-wrapped IRAPs are caught by scanning the inner NALs. A false
+    negative only delays a session start until the next IRAP.
     """
     if len(payload) < 2:
         return False
@@ -309,10 +312,10 @@ class _RtspSession:
         self.playing = False
         self._writer_task: asyncio.Task[None] | None = None
         self._closed = False
-        # When PLAY starts, request a fresh keyframe upstream so the client
-        # has something to decode within a frame or two instead of waiting
-        # for the next natural IDR.
+        # Forward nothing until an IRAP arrives, so the client decodes from
+        # a keyframe. Deadline armed at PLAY; see _keyframe_gate_open.
         self.want_keyframe = True
+        self._keyframe_gate_deadline_ns: int = 0
 
         # Pacer state — see _PACER_INITIAL_DELAY_NS for the rationale.
         # Both fields are None until the first packet anchors the timeline.
@@ -333,8 +336,31 @@ class _RtspSession:
         # first SR as soon as there's anything to anchor".
         self._last_sr_at_ns: int = 0
 
-    def queue_frame(self, frame: _RtpFrame) -> None:
+    def _keyframe_gate_open(self, frame: _RtpFrame, is_parameter_set: bool) -> bool:
+        """Whether to forward *frame* while still waiting for an IRAP.
+
+        An IRAP opens the gate, as does the deadline. Parameter sets pass
+        through without opening it.
+        """
+        if _is_h265_irap(frame.payload):
+            self.want_keyframe = False
+            return True
+        if time.monotonic_ns() >= self._keyframe_gate_deadline_ns:
+            LOGGER.warning(
+                "RTSP session %s (peer %s): no IRAP within %.1fs of PLAY; "
+                "forwarding mid-GOP",
+                self.id,
+                self.peer,
+                _KEYFRAME_GATE_TIMEOUT_NS / 1e9,
+            )
+            self.want_keyframe = False
+            return True
+        return is_parameter_set
+
+    def queue_frame(self, frame: _RtpFrame, *, is_parameter_set: bool = False) -> None:
         if self._closed or not self.playing:
+            return
+        if self.want_keyframe and not self._keyframe_gate_open(frame, is_parameter_set):
             return
         if self.queue.qsize() >= _SESSION_QUEUE_HIGH_WATER:
             LOGGER.warning(
@@ -355,6 +381,7 @@ class _RtspSession:
         if self._writer_task is not None:
             return
         self.playing = True
+        self._keyframe_gate_deadline_ns = time.monotonic_ns() + _KEYFRAME_GATE_TIMEOUT_NS
         self._writer_task = asyncio.create_task(self._writer_loop())
 
     async def close(self) -> None:
@@ -587,12 +614,13 @@ class Go2RtcRtspStream:
         decode or inspect it beyond looking for parameter-set NALs.
         """
         vps, sps, pps = _scan_h265_nals_for_parameter_sets(payload)
-        if vps or sps or pps:
+        is_parameter_set = bool(vps or sps or pps)
+        if is_parameter_set:
             self._params.update(vps, sps, pps)
 
         frame = _RtpFrame(payload=payload, timestamp=timestamp, marker=marker)
         for session in self._sessions.values():
-            session.queue_frame(frame)
+            session.queue_frame(frame, is_parameter_set=is_parameter_set)
 
     def request_keyframe_if_needed(self) -> None:
         """Hook for the relay to fire a PLI on its own schedule."""
