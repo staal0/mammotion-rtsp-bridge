@@ -85,7 +85,7 @@ from mammotion_webrtc.agora_session import (
 )
 from mammotion_webrtc.aiortc_relay import AgoraToRtspRelay
 from mammotion_webrtc.go2rtc_register import Go2RTCStreamRegistrar
-from mammotion_webrtc.rtsp_server import Go2RtcRtspStream
+from mammotion_webrtc.rtsp_server import Go2RtcRtspStream, RtpOutputClock
 
 LOGGER = logging.getLogger("mammotion_webrtc_bridge")
 
@@ -251,9 +251,13 @@ async def main() -> None:
     # graceful stop the inner function returns and we exit. On dryness
     # watchdog trip the inner function raises _DryWatchdogTripped, all
     # resources are torn down inside it, and we re-enter for a fresh start.
+    # Outlives the retry loop so RTP timestamps stay continuous when the dry
+    # watchdog rebuilds the RTSP server under a still-connected client.
+    rtp_clock = RtpOutputClock()
+
     while not stop_async.is_set():
         try:
-            await _run_bridge_session(stop_async, MammotionClient, config)
+            await _run_bridge_session(stop_async, MammotionClient, config, rtp_clock)
             return
         except _DryWatchdogTripped as exc:
             LOGGER.warning(
@@ -272,6 +276,7 @@ async def _run_bridge_session(
     stop_async: asyncio.Event,
     MammotionClient: Any,
     config: dict[str, Any],
+    rtp_clock: RtpOutputClock,
 ) -> None:
     """One full bootstrap → run → cleanup cycle.
 
@@ -548,6 +553,7 @@ async def _run_bridge_session(
         bind=rtsp_bind,
         port=rtsp_port,
         mount_point=stream_name,
+        clock=rtp_clock,
     )
     relay = AgoraToRtspRelay(
         credentials_provider=credentials_provider,

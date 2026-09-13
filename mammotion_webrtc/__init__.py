@@ -30,6 +30,7 @@ __all__ = [
     "AgoraToRtspRelay",
     "Go2RTCStreamRegistrar",
     "Go2RtcRtspStream",
+    "RtpOutputClock",
     "SDPParser",
     "StreamCredentials",
     "__version__",
@@ -44,5 +45,5 @@ from .agora_edge import (
 from .agora_session import StreamCredentials
 from .aiortc_relay import AgoraToRtspRelay
 from .go2rtc_register import Go2RTCStreamRegistrar
-from .rtsp_server import Go2RtcRtspStream
+from .rtsp_server import Go2RtcRtspStream, RtpOutputClock
 from .sdp import SDPParser, parse_offer_to_ortc

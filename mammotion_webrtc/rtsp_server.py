@@ -94,15 +94,11 @@ _PACER_MAX_SLEEP_NS = 1_000_000_000  # 1 s
 # Chrome/MSE renders bursty; 5 s is what most production RTSP servers use.
 _RTCP_SR_INTERVAL_NS = 5_000_000_000
 
-# How long a session waits for an IRAP after PLAY before giving up and
-# forwarding mid-GOP anyway. The gate sends nothing while it waits, and our
-# client is go2rtc, whose RTSP read timeout is 5s (pkg/rtsp/client.go:
-# `var Timeout = time.Second * 5`). Stay well under it or go2rtc drops the
-# connection mid-gate.
+# Give up waiting for an IRAP after this long and forward mid-GOP. We send
+# nothing while waiting, so stay well under go2rtc's 5s RTSP read timeout.
 _KEYFRAME_GATE_TIMEOUT_NS = 2_000_000_000  # 2 s
 
-# Re-ask upstream for a keyframe this often while the gate is closed. One
-# PLI is easy to lose on a weak link.
+# Re-PLI this often while waiting; one request is easy to lose.
 _KEYFRAME_PLI_RETRY_NS = 1_000_000_000  # 1 s
 
 # NTP epoch offset: seconds between 1900-01-01 and 1970-01-01.
@@ -285,6 +281,32 @@ def _build_rtp_packet(
     return header + payload
 
 
+class RtpOutputClock:
+    """Monotonic RTP timestamp source, shared by every session on a stream.
+
+    Upstream bases are random (RFC 3550 5.1) and change whenever the Agora
+    session does, so we forward deltas rather than values. Owning this
+    outside the stream keeps the timeline continuous when the bridge tears
+    the RTSP server down and re-bootstraps.
+    """
+
+    def __init__(self) -> None:
+        self.value: int = 0
+        self._last_in: int | None = None
+
+    def advance(self, in_timestamp: int) -> int:
+        """Map an upstream timestamp onto the output clock and return it."""
+        if self._last_in is None:
+            self._last_in = in_timestamp
+            return self.value
+        delta = (in_timestamp - self._last_in) & 0xFFFFFFFF
+        if delta >= 0x80000000 or delta > _PACER_REANCHOR_THRESHOLD_TS:
+            delta = 0  # upstream went backwards or jumped; hold and re-anchor
+        self._last_in = in_timestamp
+        self.value = (self.value + delta) & 0xFFFFFFFF
+        return self.value
+
+
 @dataclass
 class _RtpFrame:
     """One payload to forward, queued per session."""
@@ -319,11 +341,11 @@ class _RtspSession:
         self.playing = False
         self._writer_task: asyncio.Task[None] | None = None
         self._closed = False
-        # Forward nothing until an IRAP arrives, so the client decodes from
-        # a keyframe. Deadline armed at PLAY; see _keyframe_gate_open.
+        # Wait for an IRAP before forwarding; see _keyframe_gate_open.
         self.want_keyframe = True
         self._keyframe_gate_deadline_ns: int = 0
         self._last_pli_ns: int = 0
+
 
         # Pacer state — see _PACER_INITIAL_DELAY_NS for the rationale.
         # Both fields are None until the first packet anchors the timeline.
@@ -348,8 +370,7 @@ class _RtspSession:
         """Whether to forward *frame* while still waiting for an IRAP.
 
         An IRAP opens the gate, as does the deadline. Parameter sets pass
-        through without opening it. While waiting we re-PLI upstream on a
-        timer, since the one fired at PLAY may not have survived the link.
+        through without opening it. We re-PLI on a timer while waiting.
         """
         if _is_h265_irap(frame.payload):
             self.want_keyframe = False
@@ -566,6 +587,7 @@ class Go2RtcRtspStream:
         port: int = 8554,
         mount_point: str = "mammotion",
         on_keyframe_request: "callable | None" = None,
+        clock: "RtpOutputClock | None" = None,
     ) -> None:
         self._bind = bind
         self._port = port
@@ -580,6 +602,10 @@ class Go2RtcRtspStream:
         self._sessions: dict[str, _RtspSession] = {}
         self._lock = asyncio.Lock()
         self._started_at_ns = time.monotonic_ns()
+
+        # Pass a shared clock to keep timestamps continuous across bridge
+        # restarts; otherwise this stream gets its own.
+        self._clock = clock if clock is not None else RtpOutputClock()
 
     # ------------------------------------------------------------------
     # Public API used by the relay
@@ -633,7 +659,9 @@ class Go2RtcRtspStream:
         if is_parameter_set:
             self._params.update(vps, sps, pps)
 
-        frame = _RtpFrame(payload=payload, timestamp=timestamp, marker=marker)
+        frame = _RtpFrame(
+            payload=payload, timestamp=self._clock.advance(timestamp), marker=marker
+        )
         for session in self._sessions.values():
             session.queue_frame(frame, is_parameter_set=is_parameter_set)
 
@@ -839,7 +867,7 @@ class Go2RtcRtspStream:
             "Range": "npt=0.000-",
             "RTP-Info": (
                 f"url={self._control_url('trackID=0')};"
-                f"seq={session.sequence_number};rtptime=0"
+                f"seq={session.sequence_number};rtptime={self._clock.value}"
             ),
         })
 
