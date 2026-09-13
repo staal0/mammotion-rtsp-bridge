@@ -95,8 +95,15 @@ _PACER_MAX_SLEEP_NS = 1_000_000_000  # 1 s
 _RTCP_SR_INTERVAL_NS = 5_000_000_000
 
 # How long a session waits for an IRAP after PLAY before giving up and
-# forwarding mid-GOP anyway.
-_KEYFRAME_GATE_TIMEOUT_NS = 3_000_000_000  # 3 s
+# forwarding mid-GOP anyway. The gate sends nothing while it waits, and our
+# client is go2rtc, whose RTSP read timeout is 5s (pkg/rtsp/client.go:
+# `var Timeout = time.Second * 5`). Stay well under it or go2rtc drops the
+# connection mid-gate.
+_KEYFRAME_GATE_TIMEOUT_NS = 2_000_000_000  # 2 s
+
+# Re-ask upstream for a keyframe this often while the gate is closed. One
+# PLI is easy to lose on a weak link.
+_KEYFRAME_PLI_RETRY_NS = 1_000_000_000  # 1 s
 
 # NTP epoch offset: seconds between 1900-01-01 and 1970-01-01.
 _NTP_EPOCH_OFFSET = 2_208_988_800
@@ -316,6 +323,7 @@ class _RtspSession:
         # a keyframe. Deadline armed at PLAY; see _keyframe_gate_open.
         self.want_keyframe = True
         self._keyframe_gate_deadline_ns: int = 0
+        self._last_pli_ns: int = 0
 
         # Pacer state — see _PACER_INITIAL_DELAY_NS for the rationale.
         # Both fields are None until the first packet anchors the timeline.
@@ -340,12 +348,14 @@ class _RtspSession:
         """Whether to forward *frame* while still waiting for an IRAP.
 
         An IRAP opens the gate, as does the deadline. Parameter sets pass
-        through without opening it.
+        through without opening it. While waiting we re-PLI upstream on a
+        timer, since the one fired at PLAY may not have survived the link.
         """
         if _is_h265_irap(frame.payload):
             self.want_keyframe = False
             return True
-        if time.monotonic_ns() >= self._keyframe_gate_deadline_ns:
+        now = time.monotonic_ns()
+        if now >= self._keyframe_gate_deadline_ns:
             LOGGER.warning(
                 "RTSP session %s (peer %s): no IRAP within %.1fs of PLAY; "
                 "forwarding mid-GOP",
@@ -355,6 +365,9 @@ class _RtspSession:
             )
             self.want_keyframe = False
             return True
+        if now - self._last_pli_ns >= _KEYFRAME_PLI_RETRY_NS:
+            self._last_pli_ns = now
+            self.stream.request_keyframe_if_needed()
         return is_parameter_set
 
     def queue_frame(self, frame: _RtpFrame, *, is_parameter_set: bool = False) -> None:
@@ -381,7 +394,9 @@ class _RtspSession:
         if self._writer_task is not None:
             return
         self.playing = True
-        self._keyframe_gate_deadline_ns = time.monotonic_ns() + _KEYFRAME_GATE_TIMEOUT_NS
+        now = time.monotonic_ns()
+        self._keyframe_gate_deadline_ns = now + _KEYFRAME_GATE_TIMEOUT_NS
+        self._last_pli_ns = now  # PLAY already fired one
         self._writer_task = asyncio.create_task(self._writer_loop())
 
     async def close(self) -> None:
